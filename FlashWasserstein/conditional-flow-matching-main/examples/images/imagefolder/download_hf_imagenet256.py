@@ -8,10 +8,12 @@ import os
 import tempfile
 import time
 import urllib.request
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 
 
 REPO_ID = "benjamin-paine/imagenet-1k-256x256"
+USER_AGENT = "Mozilla/5.0 (compatible; FlashWasserstein ImageNet downloader)"
 
 
 def endpoint_base() -> str:
@@ -26,9 +28,34 @@ def resolve_url() -> str:
     return f"{endpoint_base()}/datasets/{REPO_ID}/resolve/main"
 
 
+def urlopen_with_headers(url: str, timeout: int):
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def known_split_files(split: str):
+    if split == "train":
+        return [
+            {"path": f"data/train-{idx:05d}-of-00040.parquet", "size": None}
+            for idx in range(40)
+        ]
+    return []
+
+
 def list_files(split: str):
-    with urllib.request.urlopen(api_url(), timeout=60) as response:
-        entries = json.load(response)
+    try:
+        with urlopen_with_headers(api_url(), timeout=60) as response:
+            entries = json.load(response)
+    except (HTTPError, URLError) as exc:
+        files = known_split_files(split)
+        if files:
+            print(
+                f"warning: failed to list files from {api_url()} ({exc}); "
+                f"falling back to known {split} shard names.",
+                flush=True,
+            )
+            return files
+        raise
     prefix = f"data/{split}-"
     files = [
         entry
@@ -50,7 +77,7 @@ def download_file(url: str, dest: Path, expected_size: int | None) -> None:
     tmp_path = Path(tmp_name)
     try:
         start = time.perf_counter()
-        with urllib.request.urlopen(url, timeout=120) as response, tmp_path.open("wb") as out:
+        with urlopen_with_headers(url, timeout=120) as response, tmp_path.open("wb") as out:
             while True:
                 chunk = response.read(8 * 1024 * 1024)
                 if not chunk:
