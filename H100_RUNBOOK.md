@@ -26,8 +26,10 @@ python -m pytest tests/test_latent_ot.py -q
 
 ## 2. Download ImageNet-256
 
+If the node cannot access Hugging Face directly, use the mirror endpoint:
+
 ```bash
-python examples/images/imagefolder/download_hf_imagenet256.py \
+HF_ENDPOINT=https://hf-mirror.com python examples/images/imagefolder/download_hf_imagenet256.py \
   --dest ~/datasets/imagenet-1k-256x256 \
   --split train
 ```
@@ -39,6 +41,18 @@ Expected train parquet directory:
 ```
 
 ## 3. Encode SD-VAE Latents
+
+Pre-cache the SD-VAE weights once. This is needed because the parallel encoder
+uses local-files-only model loading to avoid 8 workers fighting over one model
+download/cache lock:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com python - <<'PY'
+from diffusers import AutoencoderKL
+AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+print("cached stabilityai/sd-vae-ft-mse")
+PY
+```
 
 For 8 H100s, start with:
 

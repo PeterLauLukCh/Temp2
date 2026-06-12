@@ -12,12 +12,22 @@ from pathlib import Path
 
 
 REPO_ID = "benjamin-paine/imagenet-1k-256x256"
-API_URL = f"https://huggingface.co/api/datasets/{REPO_ID}/tree/main?recursive=1"
-RESOLVE_URL = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main"
+
+
+def endpoint_base() -> str:
+    return os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+
+
+def api_url() -> str:
+    return f"{endpoint_base()}/api/datasets/{REPO_ID}/tree/main?recursive=1"
+
+
+def resolve_url() -> str:
+    return f"{endpoint_base()}/datasets/{REPO_ID}/resolve/main"
 
 
 def list_files(split: str):
-    with urllib.request.urlopen(API_URL, timeout=60) as response:
+    with urllib.request.urlopen(api_url(), timeout=60) as response:
         entries = json.load(response)
     prefix = f"data/{split}-"
     files = [
@@ -72,7 +82,7 @@ def main():
     print(f"{REPO_ID} split={args.split} shards={len(files)} bytes={total}", flush=True)
     for entry in files:
         path = entry["path"]
-        url = f"{RESOLVE_URL}/{path}"
+        url = f"{resolve_url()}/{path}"
         download_file(url, dest / path, entry.get("size"))
 
     print(f"done: {dest / 'data'}", flush=True)
