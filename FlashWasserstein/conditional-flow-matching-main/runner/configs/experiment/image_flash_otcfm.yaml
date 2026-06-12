@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - image_otcfm.yaml
+
+name: "flash_otcfm"
+
+model:
+  ot_sampler: "flash"
+
+trainer:
+  devices: 1

@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# Local environments
+env/
+.venv/
+venv/
+
+# Generated experiment artifacts
+output/
+outputs/
+results*/
+*_logs/
+*.log
+
+# Large local data/model artifacts
+datasets/
+sdvae_latents/
+latents_*.pt
+projection.pt
+vae_reconstruction_grid.png
+
+# Avoid accidentally committing upstream demo media blobs.
+FlashWasserstein/conditional-flow-matching-main/assets/*.gif
