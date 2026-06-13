@@ -19,7 +19,7 @@ source ../env/bin/activate
 pip install -U pip wheel setuptools
 pip install -e .
 pip install -e ../../code
-pip install pytest diffusers transformers accelerate safetensors pyarrow pillow tqdm clean-fid
+pip install pytest POT diffusers transformers accelerate safetensors pyarrow pillow tqdm clean-fid
 
 python -m pytest tests/test_latent_ot.py -q
 ```
