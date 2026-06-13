@@ -1,4 +1,9 @@
-"""Train unconditional latent flow matching with local or global OT couplings."""
+"""Standard CIFAR-10 pixel-space FM/OT-CFM with local or global couplings.
+
+This is the first benchmark in the Flash global OT-CFM protocol.  It keeps the
+standard CIFAR UNet recipe but replaces the pairing stage with the shared
+row-conditional coupler from ``torchcfm.ot_coupling``.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, DistributedSampler
+from torchvision import datasets, transforms
 from torchvision.utils import save_image
 from tqdm import trange
 
@@ -24,16 +30,21 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from latent_ot import LatentProjector
-from torchcfm.ot_coupling import OTCouplingSampler, parse_csv_ints, peak_memory_gb, sync_if_cuda
-from torchcfm.models.unet.unet import UNetModelWrapper
+from torchcfm.models.unet.unet import UNetModelWrapper  # noqa: E402
+from torchcfm.ot_coupling import (  # noqa: E402
+    COUPLING_MODES,
+    OTCouplingSampler,
+    peak_memory_gb,
+    parse_csv_ints,
+    sync_if_cuda,
+)
 
 
 def is_distributed() -> bool:
     return int(os.environ.get("WORLD_SIZE", "1")) > 1
 
 
-def setup_distributed():
+def setup_distributed() -> tuple[int, int, torch.device]:
     if not is_distributed():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return 0, 1, device
@@ -55,7 +66,7 @@ def unwrap(model):
 
 def ema(source, target, decay: float) -> None:
     source_state = unwrap(source).state_dict()
-    target_state = unwrap(target).state_dict()
+    target_state = target.state_dict()
     for key in source_state.keys():
         target_state[key].data.copy_(target_state[key].data * decay + source_state[key].data * (1 - decay))
 
@@ -70,50 +81,19 @@ def reduce_scalar(value: float, device: torch.device, op=dist.ReduceOp.SUM) -> f
     return float(tensor.item())
 
 
-class LatentShardIterableDataset(IterableDataset):
-    """Streaming latent-shard dataset.
-
-    This avoids preloading the full ImageNet latent cache in every DDP process.
-    Shards are partitioned across rank x dataloader worker ids every epoch.
-    """
-
-    def __init__(self, latent_dir: str | Path, *, seed: int = 0):
-        super().__init__()
-        self.latent_dir = Path(latent_dir).expanduser()
-        self.shards = sorted(self.latent_dir.glob("latents_*.pt"))
-        if not self.shards:
-            raise FileNotFoundError(f"No latents_*.pt shards found in {self.latent_dir}")
-        self.seed = int(seed)
-
-    def __iter__(self):
-        worker = get_worker_info()
-        worker_id = worker.id if worker is not None else 0
-        num_workers = worker.num_workers if worker is not None else 1
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-        global_worker_id = rank * num_workers + worker_id
-        total_workers = world_size * num_workers
-        epoch = 0
-        while True:
-            order = list(range(len(self.shards)))
-            random.Random(self.seed + epoch).shuffle(order)
-            for pos, shard_idx in enumerate(order):
-                if pos % total_workers != global_worker_id:
-                    continue
-                payload = torch.load(self.shards[shard_idx], map_location="cpu")
-                z = payload["latents"]
-                y = payload.get("labels", torch.full((z.shape[0],), -1, dtype=torch.long))
-                generator = torch.Generator(device="cpu")
-                generator.manual_seed(self.seed + epoch * 1000003 + shard_idx)
-                perm = torch.randperm(z.shape[0], generator=generator)
-                for idx in perm.tolist():
-                    yield z[idx], y[idx]
-            epoch += 1
+def infinite_loader(loader, sampler=None):
+    epoch = 0
+    while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        for batch in loader:
+            yield batch
+        epoch += 1
 
 
 def build_model(args) -> UNetModelWrapper:
     return UNetModelWrapper(
-        dim=(4, 32, 32),
+        dim=(3, 32, 32),
         num_res_blocks=args.num_res_blocks,
         num_channels=args.num_channel,
         channel_mult=parse_csv_ints(args.channel_mult),
@@ -121,9 +101,30 @@ def build_model(args) -> UNetModelWrapper:
         num_head_channels=args.num_head_channels,
         attention_resolutions=args.attention_resolutions,
         dropout=args.dropout,
-        class_cond=args.class_conditional,
-        num_classes=args.num_classes,
     )
+
+
+@torch.no_grad()
+def generate_sample_grid(
+    model,
+    out_dir: Path,
+    *,
+    step: int,
+    device: torch.device,
+    sample_batch: int,
+    integration_steps: int,
+) -> None:
+    was_training = model.training
+    model.eval()
+    x = torch.randn(sample_batch, 3, 32, 32, device=device)
+    dt = 1.0 / float(integration_steps)
+    for idx in range(integration_steps):
+        t = torch.full((sample_batch,), idx / float(integration_steps), device=device)
+        x = x + dt * model(t, x)
+    image = x.float().clamp(-1, 1).add(1).mul(0.5).cpu()
+    save_image(image, out_dir / f"samples_step_{step:08d}.png", nrow=int(math.sqrt(sample_batch)))
+    if was_training:
+        model.train()
 
 
 def save_checkpoint(path: Path, net_model, ema_model, optim, sched, step: int, args) -> None:
@@ -131,7 +132,7 @@ def save_checkpoint(path: Path, net_model, ema_model, optim, sched, step: int, a
     torch.save(
         {
             "net_model": unwrap(net_model).state_dict(),
-            "ema_model": unwrap(ema_model).state_dict(),
+            "ema_model": ema_model.state_dict(),
             "optim": optim.state_dict(),
             "sched": sched.state_dict(),
             "step": int(step),
@@ -141,83 +142,28 @@ def save_checkpoint(path: Path, net_model, ema_model, optim, sched, step: int, a
     )
 
 
-@torch.no_grad()
-def generate_sample_grid(
-    model,
-    vae,
-    out_dir: Path,
-    *,
-    step: int,
-    device: torch.device,
-    sample_batch: int,
-    integration_steps: int,
-    scaling_factor: float,
-    class_conditional: bool = False,
-    num_classes: int = 1000,
-) -> None:
-    model = unwrap(model)
-    was_training = model.training
-    model.eval()
-    z = torch.randn(sample_batch, 4, 32, 32, device=device)
-    y = None
-    if class_conditional:
-        y = torch.arange(sample_batch, device=device, dtype=torch.long) % int(num_classes)
-    dt = 1.0 / float(integration_steps)
-    for idx in range(integration_steps):
-        t = torch.full((sample_batch,), idx / float(integration_steps), device=device)
-        z = z + dt * (model(t, z, y) if class_conditional else model(t, z))
-    decoded = vae.decode(z / float(scaling_factor)).sample
-    image = decoded.float().clamp(-1, 1).add(1).mul(0.5).cpu()
-    save_image(image, out_dir / f"samples_step_{step:08d}.png", nrow=int(math.sqrt(sample_batch)))
-    if was_training:
-        model.train()
-
-
-def load_vae_for_sampling(args, device: torch.device):
-    from diffusers import AutoencoderKL
-
-    vae = AutoencoderKL.from_pretrained(args.vae_model).to(device)
-    vae.eval()
-    for param in vae.parameters():
-        param.requires_grad_(False)
-    return vae
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--latent_dir", required=True)
-    parser.add_argument("--projection_path", default="")
-    parser.add_argument("--output_dir", default="./results_latent_imagenet")
-    parser.add_argument(
-        "--coupling_mode",
-        default="independent",
-        choices=[
-            "independent",
-            "local_exact_pot",
-            "local_entropic",
-            "allgather_dense_entropic",
-            "flash_global_entropic",
-            "local_pot_exact_stock",
-            "local_pot_exact_row",
-            "global_pot_exact_small",
-            "global_dense_sinkhorn",
-            "global_flash_sinkhorn",
-        ],
-    )
+    parser.add_argument("--data_dir", default="./data")
+    parser.add_argument("--output_dir", default="./results_cifar10_global_ot")
+    parser.add_argument("--coupling_mode", default="independent", choices=sorted(COUPLING_MODES))
     parser.add_argument("--context_size", type=int, default=8192)
     parser.add_argument("--eps", type=float, default=0.05)
-    parser.add_argument("--sinkhorn_iters", type=int, default=80)
+    parser.add_argument("--sinkhorn_iters", type=int, default=20)
+    parser.add_argument("--cost_feature_dim", type=int, default=0, help="0 uses full flattened pixels")
     parser.add_argument("--pot_max_context", type=int, default=2048)
     parser.add_argument("--pot_num_threads", default=1)
-    parser.add_argument("--batch_size", type=int, default=1280, help="global batch size under DDP")
+    parser.add_argument("--batch_size", type=int, default=128, help="global batch size under DDP")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--total_steps", type=int, default=2000)
+    parser.add_argument("--total_steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--warmup", type=int, default=500)
+    parser.add_argument("--warmup", type=int, default=5000)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
-    parser.add_argument("--save_step", type=int, default=1000)
-    parser.add_argument("--sample_every", type=int, default=1000)
+    parser.add_argument("--save_step", type=int, default=10000)
+    parser.add_argument("--sample_every", type=int, default=5000)
+    parser.add_argument("--sample_batch", type=int, default=64)
+    parser.add_argument("--integration_steps", type=int, default=100)
     parser.add_argument("--log_step", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_channel", type=int, default=128)
@@ -227,20 +173,9 @@ def main() -> None:
     parser.add_argument("--num_head_channels", type=int, default=64)
     parser.add_argument("--attention_resolutions", default="16")
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--class_conditional", action="store_true")
-    parser.add_argument("--num_classes", type=int, default=1000)
-    parser.add_argument(
-        "--class_aware_coupling",
-        action="store_true",
-        help="restrict OT candidate sets to same target labels; intended for class-conditional latent ImageNet",
-    )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no_flash_tf32", action="store_true")
     parser.add_argument("--no_flash_autotune", action="store_true")
-    parser.add_argument("--vae_model", default="stabilityai/sd-vae-ft-mse")
-    parser.add_argument("--scaling_factor", type=float, default=0.18215)
-    parser.add_argument("--sample_batch", type=int, default=16)
-    parser.add_argument("--integration_steps", type=int, default=50)
     args = parser.parse_args()
 
     rank, world_size, device = setup_distributed()
@@ -248,42 +183,52 @@ def main() -> None:
     if args.batch_size % world_size != 0:
         raise ValueError(f"--batch_size={args.batch_size} must be divisible by world_size={world_size}")
     local_batch = args.batch_size // world_size
+    random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed + rank)
 
-    latent_dir = Path(args.latent_dir).expanduser()
-    projection_path = Path(args.projection_path).expanduser() if args.projection_path else latent_dir / "projection.pt"
-    projector = LatentProjector.load(projection_path, device)
-    sampler = OTCouplingSampler(
+    dataset = datasets.CIFAR10(
+        root=args.data_dir,
+        train=True,
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+    )
+    sampler_ddp = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
+    loader = DataLoader(
+        dataset,
+        batch_size=local_batch,
+        shuffle=sampler_ddp is None,
+        sampler=sampler_ddp,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        drop_last=True,
+    )
+    data_iter = infinite_loader(loader, sampler_ddp)
+
+    ot_sampler = OTCouplingSampler(
         mode=args.coupling_mode,
-        feature_projector=projector,
         context_size=args.context_size,
         eps=args.eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        cost_feature_dim=args.cost_feature_dim,
         seed=args.seed,
         pot_max_context=args.pot_max_context,
         pot_num_threads=args.pot_num_threads,
         flash_allow_tf32=not args.no_flash_tf32,
         flash_autotune=not args.no_flash_autotune,
-        class_aware=args.class_aware_coupling,
     )
-
-    dataset = LatentShardIterableDataset(latent_dir, seed=args.seed)
-    loader = DataLoader(
-        dataset,
-        batch_size=local_batch,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=True,
-    )
-    data_iter = iter(loader)
 
     net_model = build_model(args).to(device)
     ema_model = copy.deepcopy(net_model).to(device)
     if world_size > 1:
         net_model = DistributedDataParallel(net_model, device_ids=[device.index])
-        ema_model = DistributedDataParallel(ema_model, device_ids=[device.index])
     optim = torch.optim.Adam(unwrap(net_model).parameters(), lr=args.lr)
 
     def warmup_lr(step):
@@ -291,28 +236,19 @@ def main() -> None:
 
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
-
     run_name = (
         f"{args.coupling_mode}_ctx{args.context_size}_eps{args.eps:g}_"
-        f"bs{args.batch_size}_seed{args.seed}"
+        f"it{args.sinkhorn_iters}_bs{args.batch_size}_seed{args.seed}"
     )
     out_dir = Path(args.output_dir).expanduser() / run_name
     if is_rank0:
         out_dir.mkdir(parents=True, exist_ok=True)
         params = sum(p.numel() for p in unwrap(net_model).parameters())
-        print(f"latent_dir={latent_dir}")
-        print(f"projection={projection_path}")
+        print(f"dataset=CIFAR10 train images={len(dataset)}")
         print(f"world_size={world_size} global_batch={args.batch_size} local_batch={local_batch}")
-        print(
-            f"coupling={args.coupling_mode} context={args.context_size} eps={args.eps} "
-            f"class_conditional={args.class_conditional} class_aware={args.class_aware_coupling}"
-        )
+        print(f"coupling={args.coupling_mode} context={args.context_size} eps={args.eps}")
         print(f"model_params={params / 1024 / 1024:.2f}M output={out_dir}")
         (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
-
-    vae = None
-    if is_rank0 and args.sample_every > 0:
-        vae = load_vae_for_sampling(args, device)
 
     metrics_path = out_dir / "metrics.jsonl"
     progress = trange(args.total_steps, dynamic_ncols=True, disable=not is_rank0)
@@ -320,34 +256,22 @@ def main() -> None:
         sync_if_cuda(device)
         step_start = time.perf_counter()
         optim.zero_grad(set_to_none=True)
-        z1, labels = next(data_iter)
-        z1 = z1.to(device, non_blocking=True).float()
-        labels = labels.to(device, non_blocking=True).long()
-        if (args.class_conditional or args.class_aware_coupling) and bool((labels < 0).any().item()):
-            raise ValueError(
-                "class-conditional or class-aware latent training requires cached labels; "
-                "found at least one label < 0 in the latent shard."
-            )
-        z0 = torch.randn_like(z1)
+        x1, _labels = next(data_iter)
+        x1 = x1.to(device, non_blocking=True)
+        x0 = torch.randn_like(x1)
 
         sync_if_cuda(device)
         ot_start = time.perf_counter()
-        sample = sampler.sample_pairs(
-            z0,
-            z1,
-            y1_local=labels if args.class_conditional or args.class_aware_coupling else None,
-            step=step,
-        )
+        coupled = ot_sampler.sample_pairs(x0, x1, step=step)
         sync_if_cuda(device)
         ot_time = time.perf_counter() - ot_start
 
-        t = torch.rand(sample.z0.shape[0], device=device)
+        t = torch.rand(coupled.x0.shape[0], device=device)
         t_view = t.view(-1, 1, 1, 1)
-        xt = (1.0 - t_view) * sample.z0 + t_view * sample.z1
-        ut = sample.z1 - sample.z0
-        y_cond = sample.y1.long() if args.class_conditional else None
+        xt = (1.0 - t_view) * coupled.x0 + t_view * coupled.x1
+        ut = coupled.x1 - coupled.x0
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp and device.type == "cuda"):
-            vt = net_model(t, xt, y_cond) if args.class_conditional else net_model(t, xt)
+            vt = net_model(t, xt)
             loss = torch.mean((vt - ut) ** 2)
 
         scaler.scale(loss).backward()
@@ -374,7 +298,7 @@ def main() -> None:
                 "images_per_s": images_per_s,
                 "peak_mem_gb": peak_memory_gb(device),
                 "lr": float(sched.get_last_lr()[0]),
-                **sample.metrics,
+                **coupled.metrics,
             }
             with metrics_path.open("a") as f:
                 f.write(json.dumps(row) + "\n")
@@ -382,18 +306,14 @@ def main() -> None:
         if is_rank0 and args.save_step > 0 and step > 0 and step % args.save_step == 0:
             save_checkpoint(out_dir / f"weights_step_{step:08d}.pt", net_model, ema_model, optim, sched, step, args)
 
-        if is_rank0 and vae is not None and args.sample_every > 0 and step > 0 and step % args.sample_every == 0:
+        if is_rank0 and args.sample_every > 0 and step > 0 and step % args.sample_every == 0:
             generate_sample_grid(
                 ema_model,
-                vae,
                 out_dir,
                 step=step,
                 device=device,
                 sample_batch=args.sample_batch,
                 integration_steps=args.integration_steps,
-                scaling_factor=args.scaling_factor,
-                class_conditional=args.class_conditional,
-                num_classes=args.num_classes,
             )
 
     if is_rank0 and args.save_step > 0:

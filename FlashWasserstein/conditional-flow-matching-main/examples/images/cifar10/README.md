@@ -54,6 +54,52 @@ For the other models, change the "otcfm" argument by "icfm" or "fm". For easy re
 
 To recompute the FID, change the PATH variable with where you have saved the downloaded weights.
 
+## Flash Global OT-CFM Protocol
+
+The standardized scaling protocol uses a separate trainer that keeps the CIFAR
+UNet recipe fixed and swaps only the endpoint coupling:
+
+```bash
+python examples/images/cifar10/bench_ot_coupling.py \
+  --context_sizes 512,1024,2048,4096,8192,16384 \
+  --local_batch 128 \
+  --eps 0.05 \
+  --sinkhorn_iters 20 \
+  --out_dir outputs/cifar10_ot_bench
+```
+
+Short sanity runs:
+
+```bash
+torchrun --standalone --nproc_per_node=1 examples/images/cifar10/train_cifar10_global_ot.py \
+  --coupling_mode independent \
+  --batch_size 128 \
+  --total_steps 50000 \
+  --sample_every 5000 \
+  --output_dir outputs/cifar10_global_ot
+
+torchrun --standalone --nproc_per_node=1 examples/images/cifar10/train_cifar10_global_ot.py \
+  --coupling_mode local_exact_pot \
+  --batch_size 128 \
+  --total_steps 50000 \
+  --sample_every 5000 \
+  --output_dir outputs/cifar10_global_ot
+
+torchrun --standalone --nproc_per_node=8 examples/images/cifar10/train_cifar10_global_ot.py \
+  --coupling_mode flash_global_entropic \
+  --batch_size 1024 \
+  --context_size 8192 \
+  --eps 0.05 \
+  --sinkhorn_iters 20 \
+  --total_steps 50000 \
+  --sample_every 5000 \
+  --output_dir outputs/cifar10_global_ot
+```
+
+Final CIFAR runs should only be launched after the sample grids are visibly
+non-noise.  The target comparison is independent FM, local exact POT, local
+entropic OT, dense/global entropic where feasible, and Flash global entropic OT.
+
 If you find this code useful in your research, please cite the following papers (expand for BibTeX):
 
 <details>

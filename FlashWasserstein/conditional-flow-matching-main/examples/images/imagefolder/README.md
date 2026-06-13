@@ -60,7 +60,47 @@ CUDA_VISIBLE_DEVICES=0 python bench_ot_pairing.py \
 
 Use `--max_pot_batch` to skip POT at large batches.
 
-## Single-GPU Training
+## Standard ImageNet-64 / ImageFolder Global OT-CFM
+
+Use `train_imagefolder_global_ot.py` for the standardized pixel-space
+ImageNet-64 benchmark. It supports `independent`, `local_exact_pot`,
+`local_entropic`, `allgather_dense_entropic`, `global_pot_exact_small`, and
+`flash_global_entropic`.
+
+The default model settings in this script are the ImageNet-64 pilot defaults:
+channels `192`, residual blocks `3`, channel multipliers `1,2,3,4`, attention
+at resolution `8`, dropout `0.1`, and LR `1e-4`.
+
+```bash
+torchrun --standalone --nproc_per_node=8 train_imagefolder_global_ot.py \
+  --data_root /path/to/imagenet64/train \
+  --coupling_mode independent \
+  --batch_size 800 \
+  --image_size 64 \
+  --total_steps 250000 \
+  --output_dir ./runs_imagenet64
+
+torchrun --standalone --nproc_per_node=8 train_imagefolder_global_ot.py \
+  --data_root /path/to/imagenet64/train \
+  --coupling_mode local_exact_pot \
+  --batch_size 800 \
+  --image_size 64 \
+  --total_steps 250000 \
+  --output_dir ./runs_imagenet64
+
+torchrun --standalone --nproc_per_node=8 train_imagefolder_global_ot.py \
+  --data_root /path/to/imagenet64/train \
+  --coupling_mode flash_global_entropic \
+  --batch_size 800 \
+  --context_size 8192 \
+  --eps 0.05 \
+  --sinkhorn_iters 20 \
+  --image_size 64 \
+  --total_steps 250000 \
+  --output_dir ./runs_imagenet64
+```
+
+## Legacy Single-GPU Training
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_imagefolder.py \
@@ -73,7 +113,7 @@ CUDA_VISIBLE_DEVICES=0 python train_imagefolder.py \
   --output_dir ./runs
 ```
 
-## 10-GPU Training
+## Legacy 10-GPU Training
 
 ```bash
 torchrun --standalone --nproc_per_node=10 train_imagefolder.py \

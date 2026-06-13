@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from latent_ot import parse_csv_ints  # noqa: E402
+from torchcfm.ot_coupling import parse_csv_ints  # noqa: E402
 from torchcfm.models.unet.unet import UNetModelWrapper  # noqa: E402
 
 
@@ -29,16 +29,25 @@ def build_model(args) -> UNetModelWrapper:
         num_head_channels=args.num_head_channels,
         attention_resolutions=args.attention_resolutions,
         dropout=args.dropout,
+        class_cond=getattr(args, "class_conditional", False),
+        num_classes=getattr(args, "num_classes", 1000),
     )
 
 
 @torch.no_grad()
-def sample_latents(model, *, batch_size: int, steps: int, device: torch.device) -> torch.Tensor:
+def sample_latents(
+    model,
+    *,
+    batch_size: int,
+    steps: int,
+    device: torch.device,
+    labels: torch.Tensor | None = None,
+) -> torch.Tensor:
     z = torch.randn(batch_size, 4, 32, 32, device=device)
     dt = 1.0 / float(steps)
     for idx in range(steps):
         t = torch.full((batch_size,), idx / float(steps), device=device)
-        z = z + dt * model(t, z)
+        z = z + dt * (model(t, z, labels) if labels is not None else model(t, z))
     return z
 
 
@@ -59,6 +68,12 @@ def main() -> None:
     parser.add_argument("--scaling_factor", type=float, default=0.18215)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--grid_every", type=int, default=1024)
+    parser.add_argument(
+        "--class_id",
+        type=int,
+        default=-1,
+        help="for class-conditional checkpoints, use a fixed class id; -1 cycles through classes",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -72,6 +87,8 @@ def main() -> None:
         "num_head_channels": 64,
         "attention_resolutions": "16",
         "dropout": 0.1,
+        "class_conditional": False,
+        "num_classes": 1000,
     }.items():
         if not hasattr(train_args, key):
             setattr(train_args, key, default)
@@ -95,7 +112,20 @@ def main() -> None:
     grid_images = []
     while produced < args.num_samples:
         batch = min(args.batch_size, args.num_samples - produced)
-        z = sample_latents(model, batch_size=batch, steps=args.integration_steps, device=device)
+        labels = None
+        if train_args.class_conditional:
+            if args.class_id >= 0:
+                labels = torch.full((batch,), args.class_id, device=device, dtype=torch.long)
+            else:
+                labels = torch.arange(produced, produced + batch, device=device, dtype=torch.long)
+                labels = labels % int(train_args.num_classes)
+        z = sample_latents(
+            model,
+            batch_size=batch,
+            steps=args.integration_steps,
+            device=device,
+            labels=labels,
+        )
         decoded = vae.decode(z / float(args.scaling_factor)).sample
         images = decoded.float().clamp(-1, 1).add(1).mul(0.5).cpu()
         for idx, image in enumerate(images):

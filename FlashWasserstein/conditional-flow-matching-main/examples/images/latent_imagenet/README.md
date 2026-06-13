@@ -1,7 +1,9 @@
 # Latent ImageNet OT-CFM Experiments
 
 This folder tests whether large-context OT couplings help latent flow matching
-and whether FlashSinkhorn makes those couplings practical.
+and whether FlashSinkhorn makes those couplings practical.  The unconditional
+ImageNet-256 latent path should now be treated as a systems diagnostic, not a
+generative-quality benchmark.  For quality claims, use class conditioning.
 
 ## 1. Encode ImageNet-256 to SD-VAE Latents
 
@@ -103,6 +105,25 @@ torchrun --standalone --nproc_per_node=10 examples/images/latent_imagenet/train_
   --output_dir outputs/latent_train
 ```
 
+Class-conditional latent ImageNet-256:
+
+```bash
+torchrun --standalone --nproc_per_node=8 examples/images/latent_imagenet/train_latent_imagenet.py \
+  --latent_dir ~/datasets/imagenet-1k-256x256/sdvae_latents \
+  --coupling_mode flash_global_entropic \
+  --class_conditional \
+  --class_aware_coupling \
+  --batch_size 2048 \
+  --context_size 16384 \
+  --eps 0.05 \
+  --sinkhorn_iters 20 \
+  --total_steps 50000 \
+  --output_dir outputs/latent_train_classcond
+```
+
+The legacy names `global_flash_sinkhorn`, `global_dense_sinkhorn`, and
+`local_pot_exact_row` remain accepted aliases.
+
 ## 4. Longer Runs
 
 Use the same commands with `--total_steps 20000` first. Extend the best two
@@ -119,6 +140,9 @@ python examples/images/latent_imagenet/generate_latent_samples.py \
   --batch_size 128 \
   --integration_steps 100
 ```
+
+For class-conditional checkpoints, add `--class_id <id>` for a single class or
+omit it to cycle labels across generated samples.
 
 The generated PNG folder can be passed to external FID/KID tooling. All methods
 share the same VAE, latent model, projection, cost normalization, optimizer,
