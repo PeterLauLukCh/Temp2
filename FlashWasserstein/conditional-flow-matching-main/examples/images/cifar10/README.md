@@ -100,6 +100,29 @@ Final CIFAR runs should only be launched after the sample grids are visibly
 non-noise.  The target comparison is independent FM, local exact POT, local
 entropic OT, dense/global entropic where feasible, and Flash global entropic OT.
 
+For offline evaluation on machines where CleanFID cannot download CIFAR
+statistics, use the folder evaluator.  It writes a local CIFAR-10 reference
+folder, generates samples from every matching run checkpoint, and computes
+folder-vs-folder FID/KID:
+
+```bash
+python examples/images/cifar10/evaluate_cifar10_folders.py \
+  --run_root ~/FlashSinkhorn/output/cifar10_context_sweep_100k \
+  --step 100000 \
+  --out_dir ~/FlashSinkhorn/output/cifar10_eval_100k \
+  --data_dir ~/datasets/cifar10 \
+  --split train \
+  --num_gen 50000 \
+  --batch_size 1024 \
+  --integration_method euler \
+  --integration_steps 100 \
+  --compute_kid
+```
+
+Repeat the same command with `--integration_steps 25` and `--integration_steps
+50` for low-NFE comparisons.  Use `--integration_method heun` for the matched
+Heun curve.
+
 If you find this code useful in your research, please cite the following papers (expand for BibTeX):
 
 <details>
