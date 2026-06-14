@@ -46,6 +46,20 @@ torchrun --standalone --nproc_per_node=8 examples/images/cifar10/train_cifar10_g
 
 Only launch 400k-step final runs after these sample grids are non-noise.
 
+Evaluate a completed CIFAR sweep directly from checkpoints:
+
+```bash
+python examples/images/cifar10/evaluate_cifar10_global_ot.py \
+  --run_root outputs/cifar10_global_ot \
+  --step 50000 \
+  --num_gen 50000 \
+  --integration_method euler \
+  --integration_steps 100 \
+  --out_json outputs/cifar10_global_ot/fid_step50000.json
+```
+
+For a quick but noisy read, use `--num_gen 10000` first.
+
 ## Stage 2: ImageNet-64 Pixel-Space
 
 Use an ImageFolder-format ImageNet-64 train root.
