@@ -23,6 +23,7 @@ from latent_ot import (  # noqa: E402
     flash_sinkhorn_row_conditional_indices,
     pair_cost,
     parse_csv_ints,
+    parse_num_threads,
     pot_row_conditional_indices,
     sync_if_cuda,
 )
@@ -139,7 +140,7 @@ def main() -> None:
     parser.add_argument("--eps", type=float, default=0.05)
     parser.add_argument("--sinkhorn_iters", type=int, default=80)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--pot_num_threads", default=1)
+    parser.add_argument("--pot_num_threads", type=parse_num_threads, default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out_dir", default="./latent_ot_coupling_bench")
     args = parser.parse_args()

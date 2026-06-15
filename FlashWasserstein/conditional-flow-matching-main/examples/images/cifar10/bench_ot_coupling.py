@@ -25,6 +25,7 @@ from torchcfm.ot_coupling import (  # noqa: E402
     flash_sinkhorn_row_conditional_indices,
     pair_cost,
     parse_csv_ints,
+    parse_num_threads,
     peak_memory_gb,
     pot_row_conditional_indices,
     reset_peak_memory,
@@ -130,7 +131,7 @@ def main() -> None:
     parser.add_argument("--sinkhorn_iters", type=int, default=20)
     parser.add_argument("--cost_feature_dim", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--pot_num_threads", default=1)
+    parser.add_argument("--pot_num_threads", type=parse_num_threads, default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out_dir", default="./cifar10_ot_coupling_bench")
     args = parser.parse_args()

@@ -36,6 +36,7 @@ from torchcfm.ot_coupling import (  # noqa: E402
     OTCouplingSampler,
     peak_memory_gb,
     parse_csv_ints,
+    parse_num_threads,
     sync_if_cuda,
 )
 
@@ -176,7 +177,7 @@ def main() -> None:
     parser.add_argument("--class_aware_coupling", action="store_true")
     parser.add_argument("--num_classes", type=int, default=0, help="0 infers ImageFolder class count")
     parser.add_argument("--pot_max_context", type=int, default=2048)
-    parser.add_argument("--pot_num_threads", default=1)
+    parser.add_argument("--pot_num_threads", type=parse_num_threads, default=1)
     parser.add_argument("--image_size", type=int, default=64)
     parser.add_argument("--no_hflip", action="store_true")
     parser.add_argument("--batch_size", type=int, default=800, help="global batch size under DDP")

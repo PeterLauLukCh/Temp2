@@ -31,6 +31,20 @@ def _import_flash_wasserstein():
         return solve_dense_otfm_pairs, solve_flash_otfm_pairs
 
 
+def _normalize_num_threads(value: Union[int, str]) -> Union[int, str]:
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("num_threads must be positive or 'max'")
+        return value
+    value = str(value).strip()
+    if value == "max":
+        return value
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("num_threads must be positive or 'max'")
+    return parsed
+
+
 class OTPlanSampler:
     """OTPlanSampler implements sampling coordinates according to an OT plan (wrt squared Euclidean
     cost) with different implementations of the plan calculation."""
@@ -98,6 +112,7 @@ class OTPlanSampler:
         # ot_fn should take (a, b, M) as arguments where a, b are marginals and
         # M is a cost matrix
         self.method = method
+        num_threads = _normalize_num_threads(num_threads)
         if method == "exact":
             self.ot_fn = partial(pot.emd, numThreads=num_threads)
         elif method == "sinkhorn":

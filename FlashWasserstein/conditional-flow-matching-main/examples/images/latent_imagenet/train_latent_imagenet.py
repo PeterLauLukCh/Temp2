@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from latent_ot import LatentProjector
-from torchcfm.ot_coupling import OTCouplingSampler, parse_csv_ints, peak_memory_gb, sync_if_cuda
+from torchcfm.ot_coupling import OTCouplingSampler, parse_csv_ints, parse_num_threads, peak_memory_gb, sync_if_cuda
 from torchcfm.models.unet.unet import UNetModelWrapper
 
 
@@ -208,7 +208,7 @@ def main() -> None:
     parser.add_argument("--eps", type=float, default=0.05)
     parser.add_argument("--sinkhorn_iters", type=int, default=80)
     parser.add_argument("--pot_max_context", type=int, default=2048)
-    parser.add_argument("--pot_num_threads", default=1)
+    parser.add_argument("--pot_num_threads", type=parse_num_threads, default=1)
     parser.add_argument("--batch_size", type=int, default=1280, help="global batch size under DDP")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--total_steps", type=int, default=2000)

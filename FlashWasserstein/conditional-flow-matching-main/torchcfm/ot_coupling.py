@@ -56,6 +56,20 @@ def parse_csv_floats(value: str) -> list[float]:
     return [float(v) for v in value.split(",") if v]
 
 
+def parse_num_threads(value: int | str) -> int | str:
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("num_threads must be positive or 'max'")
+        return value
+    value = str(value).strip()
+    if value == "max":
+        return value
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("num_threads must be positive or 'max'")
+    return parsed
+
+
 def sync_if_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -412,7 +426,7 @@ class OTCouplingSampler:
         self.cost_scale = None if cost_scale is None else float(cost_scale)
         self.seed = int(seed)
         self.pot_max_context = int(pot_max_context)
-        self.pot_num_threads = pot_num_threads
+        self.pot_num_threads = parse_num_threads(pot_num_threads)
         self.flash_allow_tf32 = bool(flash_allow_tf32)
         self.flash_autotune = bool(flash_autotune)
         self.diagnostics_plan_limit = int(diagnostics_plan_limit)

@@ -29,6 +29,20 @@ def parse_csv_ints(value: str) -> list[int]:
     return [int(v) for v in value.split(",") if v]
 
 
+def parse_num_threads(value: int | str) -> int | str:
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("num_threads must be positive or 'max'")
+        return value
+    value = str(value).strip()
+    if value == "max":
+        return value
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("num_threads must be positive or 'max'")
+    return parsed
+
+
 def sync_if_cuda(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -256,7 +270,7 @@ def main():
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_sizes", default="1280,2560,5120,8192")
     parser.add_argument("--num_blocks", type=int, default=10)
-    parser.add_argument("--num_threads", default=1)
+    parser.add_argument("--num_threads", type=parse_num_threads, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--feature_mode", default="resnet50", choices=["pixel", "lowfreq", "random_projection", "resnet50"])
     parser.add_argument("--feature_size", type=int, default=64)
