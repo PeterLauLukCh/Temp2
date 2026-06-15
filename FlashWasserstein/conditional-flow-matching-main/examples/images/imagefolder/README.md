@@ -100,6 +100,34 @@ torchrun --standalone --nproc_per_node=8 train_imagefolder_global_ot.py \
   --output_dir ./runs_imagenet64
 ```
 
+## HF Parquet ImageNet-64 Global OT-CFM
+
+For local Hugging Face Parquet shards such as
+`benjamin-paine/imagenet-1k-256x256`, use
+`train_hf_parquet_global_ot.py` directly instead of converting the dataset to
+ImageFolder:
+
+```bash
+DATA_DIR=~/datasets/imagenet-1k-256x256/data
+OUT=~/FlashSinkhorn/output/imagenet64_parquet_smoke_20k
+COMMON="--data_dir $DATA_DIR --image_size 64 --batch_size 1024 --total_steps 20000 --num_workers 4 --arrow_batch_size 256 --amp --class_conditional --sample_every 5000 --save_step 10000 --log_step 20 --output_dir $OUT --cost_feature_dim 256 --lr 1e-4"
+
+torchrun --standalone --nproc_per_node=8 train_hf_parquet_global_ot.py \
+  $COMMON \
+  --coupling_mode local_exact_pot
+
+torchrun --standalone --nproc_per_node=8 train_hf_parquet_global_ot.py \
+  $COMMON \
+  --coupling_mode flash_global_entropic \
+  --context_size 32768 \
+  --eps 0.01 \
+  --sinkhorn_iters 30
+```
+
+The first parquet experiments should keep class-conditional generation enabled
+but leave `--class_aware_coupling` off.  Class-aware OT is an ablation because
+ImageNet-1K has too many classes for small local minibatches.
+
 ## Legacy Single-GPU Training
 
 ```bash
