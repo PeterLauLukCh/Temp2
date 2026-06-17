@@ -193,6 +193,7 @@ def load_model(ckpt_path: Path, state_key: str, device: torch.device):
         raise KeyError(f"No usable model state in {ckpt_path}")
     state = {k.removeprefix("module."): v for k, v in state.items()}
     model.load_state_dict(state, strict=True)
+    train_mod.set_checkpointing(model, False)
     model.eval()
     return model, ns
 

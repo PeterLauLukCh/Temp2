@@ -16,7 +16,7 @@ if ! compgen -G "$DATA_DIR/validation-*.parquet" >/dev/null; then
     --split validation
 fi
 
-MODEL_FLAGS="--image_size 128 --num_channel 256 --num_res_blocks 2 --channel_mult 1,2,3,4 --attention_resolutions 32,16,8 --num_heads 4 --num_head_channels -1 --dropout 0.0 --use_checkpoint --resblock_updown --use_scale_shift_norm --use_new_attention_order"
+MODEL_FLAGS="--image_size 128 --num_channel 256 --num_res_blocks 2 --channel_mult 1,1,2,3,4 --attention_resolutions 32,16,8 --num_heads 4 --num_head_channels -1 --dropout 0.0 --use_checkpoint --resblock_updown --use_scale_shift_norm --use_new_attention_order"
 COMMON="--data_dir $DATA_DIR --output_dir $OUT --batch_size $BATCH --grad_accum_steps $ACCUM --total_steps $STEPS --num_workers 4 --arrow_batch_size 128 --amp --amp_dtype bf16 --class_conditional --class_aware_coupling --cost_feature_dim 512 --lr 1e-4 --warmup 5000 --grad_clip 1.0 --ema_decay 0.9999 --save_step 25000 --sample_every 25000 --sample_batch 64 --integration_steps 100 --log_step 20 --seed $SEED $MODEL_FLAGS"
 
 echo "=== independent ==="

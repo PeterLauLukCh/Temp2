@@ -228,11 +228,25 @@ def build_model(args) -> UNetModelWrapper:
         dropout=args.dropout,
         class_cond=args.class_conditional,
         num_classes=args.num_classes,
-        use_checkpoint=args.use_checkpoint,
-        use_scale_shift_norm=args.use_scale_shift_norm,
-        resblock_updown=args.resblock_updown,
-        use_new_attention_order=args.use_new_attention_order,
+        use_checkpoint=getattr(args, "use_checkpoint", False),
+        use_scale_shift_norm=getattr(args, "use_scale_shift_norm", False),
+        resblock_updown=getattr(args, "resblock_updown", False),
+        use_new_attention_order=getattr(args, "use_new_attention_order", False),
     )
+
+
+def set_checkpointing(model, enabled: bool) -> list[tuple[torch.nn.Module, bool]]:
+    previous = []
+    for module in model.modules():
+        if hasattr(module, "use_checkpoint"):
+            previous.append((module, bool(module.use_checkpoint)))
+            module.use_checkpoint = bool(enabled)
+    return previous
+
+
+def restore_checkpointing(previous: list[tuple[torch.nn.Module, bool]]) -> None:
+    for module, value in previous:
+        module.use_checkpoint = value
 
 
 @torch.no_grad()
@@ -249,19 +263,23 @@ def generate_sample_grid(
     num_classes: int,
 ) -> None:
     was_training = model.training
+    checkpoint_state = set_checkpointing(model, False)
     model.eval()
-    x = torch.randn(sample_batch, 3, image_size, image_size, device=device)
-    y = None
-    if class_conditional:
-        y = torch.arange(sample_batch, device=device, dtype=torch.long) % int(num_classes)
-    dt = 1.0 / float(integration_steps)
-    for idx in range(integration_steps):
-        t = torch.full((sample_batch,), idx / float(integration_steps), device=device)
-        x = x + dt * (model(t, x, y) if class_conditional else model(t, x))
-    image = x.float().clamp(-1, 1).add(1).mul(0.5).cpu()
-    save_image(image, out_dir / f"samples_step_{step:08d}.png", nrow=int(math.sqrt(sample_batch)))
-    if was_training:
-        model.train()
+    try:
+        x = torch.randn(sample_batch, 3, image_size, image_size, device=device)
+        y = None
+        if class_conditional:
+            y = torch.arange(sample_batch, device=device, dtype=torch.long) % int(num_classes)
+        dt = 1.0 / float(integration_steps)
+        for idx in range(integration_steps):
+            t = torch.full((sample_batch,), idx / float(integration_steps), device=device)
+            x = x + dt * (model(t, x, y) if class_conditional else model(t, x))
+        image = x.float().clamp(-1, 1).add(1).mul(0.5).cpu()
+        save_image(image, out_dir / f"samples_step_{step:08d}.png", nrow=int(math.sqrt(sample_batch)))
+    finally:
+        restore_checkpointing(checkpoint_state)
+        if was_training:
+            model.train()
 
 
 def save_checkpoint(path: Path, net_model, ema_model, optim, sched, step: int, args) -> None:
