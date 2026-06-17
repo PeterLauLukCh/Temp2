@@ -1,6 +1,7 @@
 """Various utilities for neural networks."""
 
 import math
+from contextlib import nullcontext
 
 import torch as th
 import torch.nn as nn
@@ -122,12 +123,38 @@ def checkpoint(func, inputs, params, flag):
         return func(*inputs)
 
 
+def _cuda_autocast_kwargs():
+    try:
+        return {
+            "enabled": th.is_autocast_enabled("cuda"),
+            "dtype": th.get_autocast_dtype("cuda"),
+        }
+    except (AttributeError, TypeError):
+        try:
+            return {
+                "enabled": th.is_autocast_cuda_enabled(),
+                "dtype": th.get_autocast_gpu_dtype(),
+            }
+        except AttributeError:
+            return {"enabled": False}
+
+
+def _cuda_autocast_context(kwargs):
+    if not kwargs.get("enabled", False):
+        return nullcontext()
+    try:
+        return th.autocast(device_type="cuda", dtype=kwargs["dtype"], enabled=True)
+    except (AttributeError, TypeError):
+        return th.cuda.amp.autocast(dtype=kwargs["dtype"], enabled=True)
+
+
 class CheckpointFunction(th.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, length, *args):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        ctx.cuda_autocast_kwargs = _cuda_autocast_kwargs()
         with th.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
         return output_tensors
@@ -135,7 +162,7 @@ class CheckpointFunction(th.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with th.enable_grad():
+        with th.enable_grad(), _cuda_autocast_context(ctx.cuda_autocast_kwargs):
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.
