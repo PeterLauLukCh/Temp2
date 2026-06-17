@@ -140,10 +140,15 @@ can be set to `https://hf-mirror.com`.
 cd /nas/peter.c/file/Qwen-new/temp-main/FlashWasserstein/conditional-flow-matching-main
 source /nas/peter.c/file/Qwen-new/env/bin/activate
 
-HF_ENDPOINT=https://hf-mirror.com ./examples/images/imagefolder/run_imagenet128_batch_calibration.sh
+HF_ENDPOINT=https://hf-mirror.com BATCHES="1024 1536 2048" ./examples/images/imagefolder/run_imagenet128_batch_calibration.sh
 HF_ENDPOINT=https://hf-mirror.com BATCH=1024 ACCUM=2 ./examples/images/imagefolder/run_imagenet128_eps_preflight.sh
 HF_ENDPOINT=https://hf-mirror.com BATCH=1024 ACCUM=2 nohup ./examples/images/imagefolder/run_imagenet128_250k.sh > imagenet128_250k.log 2>&1 &
 ```
+
+The formal ImageNet-128 scripts are class-conditional by default, but they do
+not enforce class-aware coupling unless `CLASS_AWARE=1` is set.  On ImageNet-1K,
+class-aware OT splits one global solve into many small per-class solves and is
+therefore a slow ablation, not the main Flash-global setting.
 
 After training, run the distributed 50k-sample Euler NFE sweep:
 
