@@ -4,13 +4,16 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-$HOME/datasets/cifar10}"
 OUT="${OUT:-$HOME/FlashSinkhorn/output/cifar10_full_400k}"
 NPROC="${NPROC:-8}"
-STEPS="${STEPS:-400000}"
+STEPS="${STEPS:-400001}"
 BATCH="${BATCH:-1024}"
 SEED="${SEED:-0}"
 COST_DIM="${COST_DIM:-256}"
 FLASH_CONTEXT="${FLASH_CONTEXT:-32768}"
 METHODS="${METHODS:-independent local_exact_pot local_entropic flash_global_entropic}"
 
+# With NPROC=8, BATCH=1024 gives local batch 128, matching the TorchCFM
+# CIFAR-10 recipe while using all GPUs. Override BATCH only for a large-batch
+# scaling ablation.
 COMMON="--data_dir $DATA_DIR --output_dir $OUT --batch_size $BATCH --total_steps $STEPS --num_workers 8 --amp --cost_feature_dim $COST_DIM --lr 2e-4 --warmup 5000 --grad_clip 1.0 --ema_decay 0.9999 --save_step 50000 --sample_every 25000 --sample_batch 64 --integration_steps 100 --log_step 20 --seed $SEED --num_channel 128 --num_res_blocks 2 --channel_mult 1,2,2,2 --attention_resolutions 16 --num_heads 4 --num_head_channels 64 --dropout 0.1"
 
 for METHOD in $METHODS; do

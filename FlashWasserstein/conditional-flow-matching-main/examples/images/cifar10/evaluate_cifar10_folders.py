@@ -11,13 +11,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from PIL import Image
 from torchvision import datasets
-from torchvision.utils import save_image
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -25,6 +27,38 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from torchcfm.models.unet.unet import UNetModelWrapper  # noqa: E402
+
+
+def init_distributed() -> tuple[torch.device, int, int]:
+    if "RANK" not in os.environ:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        return device, 0, 1
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+    dist.init_process_group(backend=backend)
+    return device, rank, world_size
+
+
+def barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def reduce_max_float(value: float, device: torch.device) -> float:
+    if not (dist.is_available() and dist.is_initialized()):
+        return float(value)
+    tensor = torch.tensor([float(value)], device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
 
 
 def parse_csv_ints(value) -> list[int]:
@@ -47,32 +81,42 @@ def build_model(train_args: dict, device: torch.device) -> UNetModelWrapper:
 
 
 def load_model(checkpoint_path: Path, device: torch.device, state_key: str) -> UNetModelWrapper:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     train_args = checkpoint.get("args", {})
     model = build_model(train_args, device)
     if state_key not in checkpoint:
         available = ", ".join(sorted(k for k, v in checkpoint.items() if isinstance(v, dict)))
         raise KeyError(f"{checkpoint_path} has no state key {state_key!r}; available dict keys: {available}")
-    model.load_state_dict(checkpoint[state_key])
+    state = {k.removeprefix("module."): v for k, v in checkpoint[state_key].items()}
+    model.load_state_dict(state)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def integrate(model, x: torch.Tensor, *, steps: int, method: str) -> torch.Tensor:
+def integrate(
+    model,
+    x: torch.Tensor,
+    *,
+    steps: int,
+    method: str,
+    amp: bool,
+    amp_dtype: torch.dtype,
+) -> torch.Tensor:
     dt = 1.0 / float(steps)
     for idx in range(steps):
         t = torch.full((x.shape[0],), idx / float(steps), device=x.device)
-        if method == "euler":
-            x = x + dt * model(t, x)
-        elif method == "heun":
-            v0 = model(t, x)
-            x_pred = x + dt * v0
-            t_next = torch.full((x.shape[0],), (idx + 1) / float(steps), device=x.device)
-            v1 = model(t_next, x_pred)
-            x = x + 0.5 * dt * (v0 + v1)
-        else:
-            raise ValueError(f"Unknown integration method: {method}")
+        with torch.autocast(device_type=x.device.type, dtype=amp_dtype, enabled=amp and x.is_cuda):
+            if method == "euler":
+                x = x + dt * model(t, x).float()
+            elif method == "heun":
+                v0 = model(t, x).float()
+                x_pred = x + dt * v0
+                t_next = torch.full((x.shape[0],), (idx + 1) / float(steps), device=x.device)
+                v1 = model(t_next, x_pred).float()
+                x = x + 0.5 * dt * (v0 + v1)
+            else:
+                raise ValueError(f"Unknown integration method: {method}")
     return x
 
 
@@ -91,6 +135,14 @@ def write_cifar_reference(data_dir: Path, out_dir: Path, split: str) -> int:
     return len(dataset)
 
 
+def save_tensor_images(x: torch.Tensor, out_dir: Path, indices: list[int]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    x = ((x.clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+    x = x.permute(0, 2, 3, 1).cpu().numpy()
+    for arr, idx in zip(x, indices, strict=True):
+        Image.fromarray(arr).save(out_dir / f"{idx:08d}.png")
+
+
 @torch.no_grad()
 def generate_folder(
     model,
@@ -100,25 +152,39 @@ def generate_folder(
     batch_size: int,
     seed: int,
     device: torch.device,
+    rank: int,
+    world_size: int,
     integration_steps: int,
     integration_method: str,
+    amp: bool,
+    amp_dtype: torch.dtype,
 ) -> float:
     if image_count(out_dir) >= num_gen:
         return 0.0
     out_dir.mkdir(parents=True, exist_ok=True)
     generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
+    generator.manual_seed(seed + 1009 * rank)
     start = time.perf_counter()
-    written = 0
-    while written < num_gen:
-        batch = min(batch_size, num_gen - written)
+    indices = list(range(rank, num_gen, world_size))
+    cursor = 0
+    while cursor < len(indices):
+        batch_indices = indices[cursor : cursor + batch_size]
+        cursor += len(batch_indices)
+        missing = [idx for idx in batch_indices if not (out_dir / f"{idx:08d}.png").exists()]
+        if not missing:
+            continue
+        batch = len(missing)
         x = torch.randn(batch, 3, 32, 32, generator=generator, device=device)
-        x = integrate(model, x, steps=integration_steps, method=integration_method)
-        x = x.float().clamp(-1, 1).add(1).mul(0.5).cpu()
-        for k in range(batch):
-            save_image(x[k], out_dir / f"{written + k:08d}.png")
-        written += batch
-        print(f"generated {written}/{num_gen} -> {out_dir}", flush=True)
+        x = integrate(
+            model,
+            x,
+            steps=integration_steps,
+            method=integration_method,
+            amp=amp,
+            amp_dtype=amp_dtype,
+        )
+        save_tensor_images(x, out_dir, missing)
+        print(f"rank {rank}: generated through index {missing[-1]} -> {out_dir}", flush=True)
     return time.perf_counter() - start
 
 
@@ -159,21 +225,26 @@ def main() -> None:
     parser.add_argument("--include", default="", help="Comma-separated run-name substrings to evaluate")
     parser.add_argument("--only_generate", action="store_true")
     parser.add_argument("--only_score", action="store_true")
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp_dtype", choices=["fp16", "bf16"], default="fp16")
     args = parser.parse_args()
 
+    device, rank, world_size = init_distributed()
     run_root = Path(args.run_root).expanduser()
     out_dir = Path(args.out_dir).expanduser()
     data_dir = Path(args.data_dir).expanduser()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
     step_tag = f"{args.step:08d}"
     real_dir = out_dir / f"cifar10_{args.split}_real"
     gen_root = out_dir / f"generated_step_{step_tag}_{args.integration_method}{args.integration_steps}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"device={device}", flush=True)
-    print(f"writing/checking CIFAR-10 {args.split} reference: {real_dir}", flush=True)
-    n_real = write_cifar_reference(data_dir, real_dir, args.split)
-    print(f"reference images={n_real}", flush=True)
+    if rank == 0:
+        print(f"device={device} world_size={world_size}", flush=True)
+        print(f"writing/checking CIFAR-10 {args.split} reference: {real_dir}", flush=True)
+        n_real = write_cifar_reference(data_dir, real_dir, args.split)
+        print(f"reference images={n_real}", flush=True)
+    barrier()
 
     results = []
     for run_dir in select_run_dirs(run_root, args.include):
@@ -186,19 +257,25 @@ def main() -> None:
         if not args.only_score:
             print(f"loading {checkpoint}", flush=True)
             model = load_model(checkpoint, device, args.state_key)
-            gen_time = generate_folder(
+            local_gen_time = generate_folder(
                 model,
                 gen_dir,
                 num_gen=args.num_gen,
                 batch_size=args.batch_size,
                 seed=args.seed,
                 device=device,
+                rank=rank,
+                world_size=world_size,
                 integration_steps=args.integration_steps,
                 integration_method=args.integration_method,
+                amp=args.amp,
+                amp_dtype=amp_dtype,
             )
+            gen_time = reduce_max_float(local_gen_time, device)
             del model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+        barrier()
 
         row = {
             "run": run_dir.name,
@@ -212,19 +289,28 @@ def main() -> None:
             "integration_steps": args.integration_steps,
             "state_key": args.state_key,
             "seed": args.seed,
+            "world_size": world_size,
+            "batch_size_per_gpu": args.batch_size,
+            "amp": args.amp,
+            "amp_dtype": args.amp_dtype if args.amp else "",
             "generation_time_s": gen_time,
         }
-        if not args.only_generate:
+        if rank == 0 and not args.only_generate:
             if image_count(gen_dir) < args.num_gen:
                 raise RuntimeError(f"{gen_dir} has fewer than {args.num_gen} PNGs")
             print(f"scoring {run_dir.name}", flush=True)
             row.update(compute_folder_scores(gen_dir, real_dir, args.fid_mode, args.compute_kid))
             print(json.dumps(row, indent=2), flush=True)
-        results.append(row)
+        if rank == 0:
+            results.append(row)
+        barrier()
 
-    out_json = out_dir / f"eval_step_{step_tag}_{args.integration_method}{args.integration_steps}_{args.num_gen}.json"
-    out_json.write_text(json.dumps(results, indent=2))
-    print(f"wrote {out_json}", flush=True)
+    if rank == 0:
+        out_json = out_dir / f"eval_step_{step_tag}_{args.integration_method}{args.integration_steps}_{args.num_gen}.json"
+        out_json.write_text(json.dumps(results, indent=2))
+        print(f"wrote {out_json}", flush=True)
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

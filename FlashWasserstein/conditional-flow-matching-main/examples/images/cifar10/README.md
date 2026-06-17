@@ -102,15 +102,15 @@ entropic OT, dense/global entropic where feasible, and Flash global entropic OT.
 For the 8-GPU H100 full run used in the Flash global OT-CFM experiments:
 
 ```bash
-HF_ENDPOINT=https://hf-mirror.com \
-  nohup ./examples/images/cifar10/run_cifar10_full_400k.sh > cifar10_full_400k.log 2>&1 &
+nohup ./examples/images/cifar10/run_cifar10_full_pipeline.sh > cifar10_full_pipeline.log 2>&1 &
 ```
 
-The runner defaults to
+This trains and then evaluates automatically.  The runner defaults to
 `METHODS="independent local_exact_pot local_entropic flash_global_entropic"`,
-global batch `1024`, projected cost dimension `256`, and Flash context `32768`.
-Use `METHODS="local_exact_pot flash_global_entropic"` for the main comparison
-only.
+`STEPS=400001`, global batch `1024`, projected cost dimension `256`, and Flash
+context `32768`.  With 8 GPUs, global batch `1024` gives local batch `128`,
+matching the TorchCFM CIFAR-10 recipe while using all GPUs.  Use
+`METHODS="local_exact_pot flash_global_entropic"` for the main comparison only.
 
 For offline evaluation on machines where CleanFID cannot download CIFAR
 statistics, use the folder evaluator.  It writes a local CIFAR-10 reference
@@ -139,6 +139,12 @@ The scripted full sweep is:
 
 ```bash
 nohup ./examples/images/cifar10/run_cifar10_eval_sweep.sh > cifar10_eval.log 2>&1 &
+```
+
+To evaluate only after an already completed training run:
+
+```bash
+TRAIN=0 EVAL=1 nohup ./examples/images/cifar10/run_cifar10_full_pipeline.sh > cifar10_eval_only.log 2>&1 &
 ```
 
 If you find this code useful in your research, please cite the following papers (expand for BibTeX):
