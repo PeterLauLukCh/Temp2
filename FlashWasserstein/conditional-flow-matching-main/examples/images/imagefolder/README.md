@@ -145,6 +145,10 @@ HF_ENDPOINT=https://hf-mirror.com BATCH=1024 ACCUM=2 ./examples/images/imagefold
 HF_ENDPOINT=https://hf-mirror.com BATCH=1024 ACCUM=2 nohup ./examples/images/imagefolder/run_imagenet128_250k.sh > imagenet128_250k.log 2>&1 &
 ```
 
+The 250k runner defaults to the main comparison only:
+`METHODS="local_exact_pot flash_global_entropic"`.  To run the full ablation,
+set `METHODS="independent local_exact_pot local_entropic flash_global_entropic"`.
+
 The formal ImageNet-128 scripts are class-conditional by default, but they do
 not enforce class-aware coupling unless `CLASS_AWARE=1` is set.  On ImageNet-1K,
 class-aware OT splits one global solve into many small per-class solves and is
