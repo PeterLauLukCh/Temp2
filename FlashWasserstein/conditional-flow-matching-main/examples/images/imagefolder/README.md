@@ -128,6 +128,26 @@ The first parquet experiments should keep class-conditional generation enabled
 but leave `--class_aware_coupling` off.  Class-aware OT is an ablation because
 ImageNet-1K has too many classes for small local minibatches.
 
+For the 8-GPU H100 full ImageNet-64 run:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+  nohup ./examples/images/imagefolder/run_imagenet64_full_250k.sh > imagenet64_full_250k.log 2>&1 &
+```
+
+The runner defaults to the full ablation set
+`METHODS="independent local_exact_pot local_entropic flash_global_entropic"`,
+global batch `2048`, projected cost dimension `256`, and Flash context
+`32768`.  Use `METHODS="local_exact_pot flash_global_entropic"` for the main
+comparison only.
+
+After training:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+  nohup ./examples/images/imagefolder/run_imagenet64_eval_sweep.sh > imagenet64_eval.log 2>&1 &
+```
+
 ## HF Parquet ImageNet-128 Formal OT-CFM
 
 The ImageNet-128 formal benchmark reuses the local

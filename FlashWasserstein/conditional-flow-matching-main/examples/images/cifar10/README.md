@@ -99,6 +99,18 @@ torchrun --standalone --nproc_per_node=8 examples/images/cifar10/train_cifar10_g
 Final CIFAR runs should only be launched after the sample grids are visibly
 non-noise.  The target comparison is independent FM, local exact POT, local
 entropic OT, dense/global entropic where feasible, and Flash global entropic OT.
+For the 8-GPU H100 full run used in the Flash global OT-CFM experiments:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+  nohup ./examples/images/cifar10/run_cifar10_full_400k.sh > cifar10_full_400k.log 2>&1 &
+```
+
+The runner defaults to
+`METHODS="independent local_exact_pot local_entropic flash_global_entropic"`,
+global batch `1024`, projected cost dimension `256`, and Flash context `32768`.
+Use `METHODS="local_exact_pot flash_global_entropic"` for the main comparison
+only.
 
 For offline evaluation on machines where CleanFID cannot download CIFAR
 statistics, use the folder evaluator.  It writes a local CIFAR-10 reference
@@ -122,6 +134,12 @@ python examples/images/cifar10/evaluate_cifar10_folders.py \
 Repeat the same command with `--integration_steps 25` and `--integration_steps
 50` for low-NFE comparisons.  Use `--integration_method heun` for the matched
 Heun curve.
+
+The scripted full sweep is:
+
+```bash
+nohup ./examples/images/cifar10/run_cifar10_eval_sweep.sh > cifar10_eval.log 2>&1 &
+```
 
 If you find this code useful in your research, please cite the following papers (expand for BibTeX):
 
