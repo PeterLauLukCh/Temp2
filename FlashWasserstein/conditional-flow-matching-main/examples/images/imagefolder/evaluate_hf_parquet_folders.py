@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sys
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,6 +53,49 @@ def count_pngs(path: Path) -> int:
     return len(list(path.glob("*.png"))) if path.exists() else 0
 
 
+def parquet_roots(data_dir: Path) -> list[Path]:
+    roots = [data_dir]
+    if (data_dir / "data").is_dir():
+        roots.append(data_dir / "data")
+    return roots
+
+
+def list_split_files(data_dir: Path, split: str) -> list[Path]:
+    files: list[Path] = []
+    for root in parquet_roots(data_dir):
+        files.extend(sorted(root.glob(f"{split}-*.parquet")))
+    return sorted(set(files))
+
+
+def choose_reference_files(data_dir: Path, preferred_split: str, fallback_split: str) -> tuple[str, list[Path]]:
+    files = list_split_files(data_dir, preferred_split)
+    if files:
+        return preferred_split, files
+    files = list_split_files(data_dir, fallback_split)
+    if files:
+        print(
+            f"warning: no {preferred_split} parquet shards found under {data_dir}; "
+            f"using {fallback_split} reference",
+            flush=True,
+        )
+        return fallback_split, files
+    raise FileNotFoundError(
+        f"No {preferred_split} or {fallback_split} parquet shards found under {data_dir}"
+    )
+
+
+def infer_label_column(files: list[Path], requested: str = "") -> str | None:
+    names = pq.ParquetFile(files[0]).schema_arrow.names
+    if requested:
+        if requested not in names:
+            raise ValueError(f"requested label column {requested!r} not found; columns={names}")
+        return requested
+    for candidate in ("label", "labels", "class_id", "class", "target"):
+        if candidate in names:
+            return candidate
+    return None
+
+
 def decode_parquet_image(obj, image_size: int) -> Image.Image:
     if isinstance(obj, dict):
         if obj.get("bytes") is not None:
@@ -67,26 +111,73 @@ def decode_parquet_image(obj, image_size: int) -> Image.Image:
     return img.convert("RGB").resize((image_size, image_size), Image.BICUBIC)
 
 
-def build_real_folder(data_dir: Path, real_dir: Path, num_real: int, image_size: int) -> None:
-    if count_pngs(real_dir) >= num_real:
-        return
+def build_real_folder(
+    files: list[Path],
+    real_dir: Path,
+    *,
+    num_real: int,
+    image_size: int,
+    mode: str,
+    num_classes: int,
+    label_column: str | None,
+) -> dict:
+    existing = count_pngs(real_dir)
+    if existing >= num_real:
+        return {"cached": True, "count": existing}
+    if existing > 0:
+        raise RuntimeError(
+            f"Reference directory {real_dir} contains only {existing}/{num_real} PNGs. "
+            "Remove it before rebuilding to avoid a class-imbalanced partial reference."
+        )
 
     real_dir.mkdir(parents=True, exist_ok=True)
-    files = sorted(data_dir.glob("train-*.parquet"))
-    if not files:
-        files = sorted((data_dir / "data").glob("train-*.parquet"))
-    if not files:
-        raise FileNotFoundError(f"No train parquet shards under {data_dir}")
+    idx = 0
+    class_counts: Counter[int] = Counter()
+    target_per_class = math.ceil(num_real / max(num_classes, 1))
+    columns = ["image"]
+    if mode == "balanced":
+        if label_column is None:
+            raise ValueError("balanced reference mode requires a label column")
+        columns.append(label_column)
 
-    idx = count_pngs(real_dir)
     for shard in files:
         pf = pq.ParquetFile(shard)
-        for batch in pf.iter_batches(batch_size=1024, columns=["image"]):
-            for obj in batch.column(0).to_pylist():
+        for batch in pf.iter_batches(batch_size=1024, columns=columns):
+            image_values = batch.column("image").to_pylist()
+            label_values = batch.column(label_column).to_pylist() if mode == "balanced" else None
+            for row_idx, obj in enumerate(image_values):
                 if idx >= num_real:
-                    return
+                    return {
+                        "cached": False,
+                        "count": idx,
+                        "class_min": min(class_counts.values()) if class_counts else None,
+                        "class_max": max(class_counts.values()) if class_counts else None,
+                        "classes": len(class_counts),
+                    }
+                if mode == "balanced":
+                    label = int(label_values[row_idx])
+                    if class_counts[label] >= target_per_class:
+                        continue
+                    class_counts[label] += 1
                 decode_parquet_image(obj, image_size).save(real_dir / f"{idx:08d}.png")
                 idx += 1
+    if idx < num_real:
+        raise RuntimeError(f"Only wrote {idx} real reference images, requested {num_real}")
+    return {
+        "cached": False,
+        "count": idx,
+        "class_min": min(class_counts.values()) if class_counts else None,
+        "class_max": max(class_counts.values()) if class_counts else None,
+        "classes": len(class_counts),
+    }
+
+
+def checkpoint_args(ckpt_path: Path) -> SimpleNamespace:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    train_args = ckpt.get("args", {})
+    if not isinstance(train_args, dict):
+        train_args = vars(train_args)
+    return SimpleNamespace(**train_args)
 
 
 def load_model(ckpt_path: Path, state_key: str, device: torch.device):
@@ -107,7 +198,7 @@ def load_model(ckpt_path: Path, state_key: str, device: torch.device):
 
 
 def call_model(model, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None):
-    trials = ((x, t, y), (t, x, y), (x, t), (t, x))
+    trials = ((t, x, y), (x, t, y), (t, x), (x, t))
     last_error: Exception | None = None
     for args in trials:
         try:
@@ -147,6 +238,7 @@ def generate_shard(
     world_size: int,
     amp: bool,
     amp_dtype: str,
+    label_mode: str,
 ) -> None:
     per_rank = math.ceil(num_gen / world_size)
     start = rank * per_rank
@@ -170,11 +262,12 @@ def generate_shard(
 
         bs = len(missing)
         x = torch.randn(bs, 3, image_size, image_size, device=device, generator=generator)
-        y = (
-            torch.randint(0, num_classes, (bs,), device=device, generator=generator)
-            if class_conditional
-            else None
-        )
+        if class_conditional and label_mode == "balanced":
+            y = torch.tensor([idx % num_classes for idx in missing], device=device, dtype=torch.long)
+        elif class_conditional:
+            y = torch.randint(0, num_classes, (bs,), device=device, generator=generator)
+        else:
+            y = None
         dt = 1.0 / steps
 
         for k in range(steps):
@@ -210,6 +303,7 @@ def main() -> None:
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--step", type=int, default=100000)
+    parser.add_argument("--image_size", type=int, default=0, help="0 infers the checkpoint image size")
     parser.add_argument("--num_gen", type=int, default=50000)
     parser.add_argument("--num_real", type=int, default=50000)
     parser.add_argument("--batch_size", type=int, default=1024, help="Generation batch per GPU/rank.")
@@ -219,6 +313,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--compute_kid", action="store_true")
     parser.add_argument("--include", default="", help="Comma-separated substrings of run names to evaluate.")
+    parser.add_argument("--reference_split", default="validation")
+    parser.add_argument("--fallback_reference_split", default="train")
+    parser.add_argument("--reference_mode", choices=["balanced", "sequential"], default="balanced")
+    parser.add_argument("--label_column", default="")
+    parser.add_argument("--label_mode", choices=["balanced", "random"], default="balanced")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp_dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--skip_scores", action="store_true")
@@ -228,7 +327,18 @@ def main() -> None:
     run_root = Path(args.run_root).expanduser()
     data_dir = Path(args.data_dir).expanduser()
     out_dir = Path(args.out_dir).expanduser()
-    real_dir = out_dir / "imagenet64_train_real"
+    ckpts = find_checkpoints(run_root, args.step, args.include or None)
+    first_ns = checkpoint_args(ckpts[0])
+    image_size = int(args.image_size or getattr(first_ns, "image_size", 64))
+    num_classes = int(getattr(first_ns, "num_classes", 1000))
+    reference_split, reference_files = choose_reference_files(
+        data_dir,
+        args.reference_split,
+        args.fallback_reference_split,
+    )
+    label_column = infer_label_column(reference_files, args.label_column)
+    reference_tag = f"imagenet{image_size}_{reference_split}_{args.reference_mode}_{args.num_real}"
+    real_dir = out_dir / reference_tag
 
     if is_rank0(rank):
         print(
@@ -238,6 +348,10 @@ def main() -> None:
                     "batch_size_per_gpu": args.batch_size,
                     "num_gen": args.num_gen,
                     "integration": f"{args.integration_method}{args.integration_steps}",
+                    "image_size": image_size,
+                    "reference_split": reference_split,
+                    "reference_mode": args.reference_mode,
+                    "label_mode": args.label_mode,
                     "amp": args.amp,
                     "amp_dtype": args.amp_dtype,
                 },
@@ -245,10 +359,32 @@ def main() -> None:
             ),
             flush=True,
         )
-        build_real_folder(data_dir, real_dir, args.num_real, 64)
+        reference_info = build_real_folder(
+            reference_files,
+            real_dir,
+            num_real=args.num_real,
+            image_size=image_size,
+            mode=args.reference_mode,
+            num_classes=num_classes,
+            label_column=label_column,
+        )
+        (real_dir / "reference_info.json").write_text(
+            json.dumps(
+                {
+                    "split": reference_split,
+                    "mode": args.reference_mode,
+                    "num_real": args.num_real,
+                    "image_size": image_size,
+                    "num_classes": num_classes,
+                    "label_column": label_column,
+                    "files": [str(path) for path in reference_files],
+                    **reference_info,
+                },
+                indent=2,
+            )
+        )
     barrier()
 
-    ckpts = find_checkpoints(run_root, args.step, args.include or None)
     results = []
     for ckpt in ckpts:
         run = ckpt.parent.name
@@ -256,7 +392,11 @@ def main() -> None:
             print(f"Evaluating {run}", flush=True)
 
         model, ns = load_model(ckpt, args.state_key, device)
-        gen_dir = out_dir / f"generated_step_{args.step:08d}_{args.integration_method}{args.integration_steps}" / run
+        gen_dir = (
+            out_dir
+            / f"generated_im{image_size}_step_{args.step:08d}_{args.integration_method}{args.integration_steps}_labels{args.label_mode}"
+            / run
+        )
         generate_shard(
             model=model,
             ns=ns,
@@ -271,6 +411,7 @@ def main() -> None:
             world_size=world_size,
             amp=args.amp,
             amp_dtype=args.amp_dtype,
+            label_mode=args.label_mode,
         )
         del model
         if device.type == "cuda":
@@ -294,8 +435,12 @@ def main() -> None:
                 "gen_dir": str(gen_dir),
                 "real_dir": str(real_dir),
                 "step": args.step,
+                "image_size": image_size,
                 "num_gen": args.num_gen,
                 "num_real": args.num_real,
+                "reference_split": reference_split,
+                "reference_mode": args.reference_mode,
+                "label_mode": args.label_mode,
                 "integration_method": args.integration_method,
                 "integration_steps": args.integration_steps,
                 "state_key": args.state_key,
@@ -324,7 +469,7 @@ def main() -> None:
     if is_rank0(rank) and not args.skip_scores:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_json = out_dir / (
-            f"eval_step_{args.step:08d}_{args.integration_method}{args.integration_steps}_{args.num_gen}.json"
+            f"eval_im{image_size}_step_{args.step:08d}_{args.integration_method}{args.integration_steps}_labels{args.label_mode}_{args.num_gen}.json"
         )
         out_json.write_text(json.dumps(results, indent=2))
         print(f"Wrote {out_json}", flush=True)

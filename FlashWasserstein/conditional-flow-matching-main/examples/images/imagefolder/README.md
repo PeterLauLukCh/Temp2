@@ -128,6 +128,41 @@ The first parquet experiments should keep class-conditional generation enabled
 but leave `--class_aware_coupling` off.  Class-aware OT is an ablation because
 ImageNet-1K has too many classes for small local minibatches.
 
+## HF Parquet ImageNet-128 Formal OT-CFM
+
+The ImageNet-128 formal benchmark reuses the local
+`benjamin-paine/imagenet-1k-256x256` Parquet shards and resizes images to
+128x128 at decode time.  The validation split is used for balanced-label
+FID/KID; if it is missing, the scripts download it through `HF_ENDPOINT`, which
+can be set to `https://hf-mirror.com`.
+
+```bash
+cd /nas/peter.c/file/Qwen-new/temp-main/FlashWasserstein/conditional-flow-matching-main
+source /nas/peter.c/file/Qwen-new/env/bin/activate
+
+HF_ENDPOINT=https://hf-mirror.com ./examples/images/imagefolder/run_imagenet128_batch_calibration.sh
+HF_ENDPOINT=https://hf-mirror.com BATCH=1024 ACCUM=2 ./examples/images/imagefolder/run_imagenet128_eps_preflight.sh
+HF_ENDPOINT=https://hf-mirror.com BATCH=1024 ACCUM=2 nohup ./examples/images/imagefolder/run_imagenet128_250k.sh > imagenet128_250k.log 2>&1 &
+```
+
+After training, run the distributed 50k-sample Euler NFE sweep:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com nohup ./examples/images/imagefolder/run_imagenet128_eval_sweep.sh > imagenet128_eval.log 2>&1 &
+```
+
+The evaluator writes JSON files such as:
+
+```text
+~/FlashSinkhorn/output/imagenet128_formal_250k_eval/eval_im128_step_00100000_euler25_labelsbalanced_50000.json
+~/FlashSinkhorn/output/imagenet128_formal_250k_eval/eval_im128_step_00200000_euler50_labelsbalanced_50000.json
+~/FlashSinkhorn/output/imagenet128_formal_250k_eval/eval_im128_step_00250000_euler100_labelsbalanced_50000.json
+```
+
+For ImageNet-128, `--batch_size` in training is the global coupling microbatch,
+while `--grad_accum_steps` controls the optimizer effective batch.  In
+evaluation, `--batch_size` is per GPU.
+
 ## Legacy Single-GPU Training
 
 ```bash

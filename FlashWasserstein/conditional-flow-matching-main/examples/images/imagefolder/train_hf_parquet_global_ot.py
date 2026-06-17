@@ -18,6 +18,7 @@ import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterator
 
@@ -227,6 +228,10 @@ def build_model(args) -> UNetModelWrapper:
         dropout=args.dropout,
         class_cond=args.class_conditional,
         num_classes=args.num_classes,
+        use_checkpoint=args.use_checkpoint,
+        use_scale_shift_norm=args.use_scale_shift_norm,
+        resblock_updown=args.resblock_updown,
+        use_new_attention_order=args.use_new_attention_order,
     )
 
 
@@ -274,6 +279,47 @@ def save_checkpoint(path: Path, net_model, ema_model, optim, sched, step: int, a
     )
 
 
+def summarize_coupling_metrics(metrics_list: list[dict]) -> dict:
+    if not metrics_list:
+        return {}
+    summary = dict(metrics_list[-1])
+    avg_keys = {
+        "sample_cost",
+        "duplicate_fraction",
+        "flash_sinkhorn_solve_time_s",
+        "pot_cost_time_s",
+        "pot_emd_time_s",
+        "pot_total_time_s",
+        "marginal_l1",
+        "plan_cost",
+    }
+    for key in avg_keys:
+        values = [m[key] for m in metrics_list if isinstance(m.get(key), (int, float))]
+        if values:
+            summary[key] = float(sum(float(v) for v in values) / len(values))
+    summary["grad_accum_steps"] = len(metrics_list)
+    return summary
+
+
+def run_context_tag(mode: str, local_batch: int, context_size: int) -> str:
+    if mode in {"independent", "local_exact_pot", "local_entropic"}:
+        return f"local{local_batch}"
+    return f"ctx{context_size}"
+
+
+def build_run_name(args, local_batch: int) -> str:
+    context_tag = run_context_tag(args.coupling_mode, local_batch, args.context_size)
+    name = (
+        f"im{args.image_size}_{args.coupling_mode}_{context_tag}_eps{args.eps:g}_"
+        f"it{args.sinkhorn_iters}_bs{args.batch_size}_accum{args.grad_accum_steps}_seed{args.seed}"
+    )
+    if args.class_conditional:
+        name = "classcond_" + name
+    if args.class_aware_coupling:
+        name += "_classaware"
+    return name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True, help="Directory containing train-*.parquet shards")
@@ -293,6 +339,7 @@ def main() -> None:
     parser.add_argument("--no_hflip", action="store_true")
     parser.add_argument("--arrow_batch_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=1024, help="global batch size under DDP")
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--total_steps", type=int, default=250000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -313,6 +360,11 @@ def main() -> None:
     parser.add_argument("--attention_resolutions", default="8")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp_dtype", choices=["fp16", "bf16"], default="fp16")
+    parser.add_argument("--use_checkpoint", action="store_true")
+    parser.add_argument("--use_scale_shift_norm", action="store_true")
+    parser.add_argument("--resblock_updown", action="store_true")
+    parser.add_argument("--use_new_attention_order", action="store_true")
     parser.add_argument("--no_flash_tf32", action="store_true")
     parser.add_argument("--no_flash_autotune", action="store_true")
     args = parser.parse_args()
@@ -321,7 +373,10 @@ def main() -> None:
     is_rank0 = rank == 0
     if args.batch_size % world_size != 0:
         raise ValueError(f"--batch_size={args.batch_size} must be divisible by world_size={world_size}")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("--grad_accum_steps must be positive")
     local_batch = args.batch_size // world_size
+    effective_batch = args.batch_size * args.grad_accum_steps
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
     if device.type == "cuda":
@@ -371,19 +426,19 @@ def main() -> None:
         return min(step + 1, args.warmup) / float(max(args.warmup, 1))
 
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
-    run_name = (
-        f"{args.coupling_mode}_ctx{args.context_size}_eps{args.eps:g}_"
-        f"it{args.sinkhorn_iters}_bs{args.batch_size}_seed{args.seed}"
-    )
-    if args.class_conditional:
-        run_name = "classcond_" + run_name
+    use_grad_scaler = args.amp and device.type == "cuda" and args.amp_dtype == "fp16"
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+    run_name = build_run_name(args, local_batch)
     out_dir = Path(args.output_dir).expanduser() / run_name
     if is_rank0:
         out_dir.mkdir(parents=True, exist_ok=True)
         params = sum(p.numel() for p in unwrap(net_model).parameters())
         print(f"dataset={args.data_dir} rows={len(dataset)} label_column={dataset.label_column}")
-        print(f"world_size={world_size} global_batch={args.batch_size} local_batch={local_batch}")
+        print(
+            f"world_size={world_size} global_batch={args.batch_size} local_batch={local_batch} "
+            f"grad_accum={args.grad_accum_steps} effective_batch={effective_batch}"
+        )
         print(
             f"coupling={args.coupling_mode} context={args.context_size} eps={args.eps} "
             f"class_conditional={args.class_conditional} class_aware={args.class_aware_coupling}"
@@ -397,32 +452,49 @@ def main() -> None:
         sync_if_cuda(device)
         step_start = time.perf_counter()
         optim.zero_grad(set_to_none=True)
-        x1, labels = next(data_iter)
-        x1 = x1.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True).long()
-        x0 = torch.randn_like(x1)
+        loss_total = 0.0
+        ot_time_total = 0.0
+        coupling_metrics = []
+        for accum_idx in range(args.grad_accum_steps):
+            x1, labels = next(data_iter)
+            x1 = x1.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True).long()
+            x0 = torch.randn_like(x1)
 
-        sync_if_cuda(device)
-        ot_start = time.perf_counter()
-        coupled = ot_sampler.sample_pairs(
-            x0,
-            x1,
-            y1_local=labels if args.class_conditional or args.class_aware_coupling else None,
-            step=step,
-        )
-        sync_if_cuda(device)
-        ot_time = time.perf_counter() - ot_start
+            sync_if_cuda(device)
+            ot_start = time.perf_counter()
+            coupled = ot_sampler.sample_pairs(
+                x0,
+                x1,
+                y1_local=labels if args.class_conditional or args.class_aware_coupling else None,
+                step=step * args.grad_accum_steps + accum_idx,
+            )
+            sync_if_cuda(device)
+            ot_time = time.perf_counter() - ot_start
+            ot_time_total += ot_time
+            coupling_metrics.append(coupled.metrics)
 
-        t = torch.rand(coupled.x0.shape[0], device=device)
-        t_view = t.view(-1, 1, 1, 1)
-        xt = (1.0 - t_view) * coupled.x0 + t_view * coupled.x1
-        ut = coupled.x1 - coupled.x0
-        y_cond = coupled.y1.long() if args.class_conditional else None
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp and device.type == "cuda"):
-            vt = net_model(t, xt, y_cond) if args.class_conditional else net_model(t, xt)
-            loss = torch.mean((vt - ut) ** 2)
+            t = torch.rand(coupled.x0.shape[0], device=device)
+            t_view = t.view(-1, 1, 1, 1)
+            xt = (1.0 - t_view) * coupled.x0 + t_view * coupled.x1
+            ut = coupled.x1 - coupled.x0
+            y_cond = coupled.y1.long() if args.class_conditional else None
+            sync_context = (
+                net_model.no_sync()
+                if world_size > 1 and accum_idx < args.grad_accum_steps - 1
+                else nullcontext()
+            )
+            with sync_context:
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=amp_dtype,
+                    enabled=args.amp and device.type == "cuda",
+                ):
+                    vt = net_model(t, xt, y_cond) if args.class_conditional else net_model(t, xt)
+                    loss = torch.mean((vt - ut) ** 2)
+                loss_total += float(loss.detach().item())
+                scaler.scale(loss / float(args.grad_accum_steps)).backward()
 
-        scaler.scale(loss).backward()
         scaler.unscale_(optim)
         torch.nn.utils.clip_grad_norm_(unwrap(net_model).parameters(), args.grad_clip)
         scaler.step(optim)
@@ -432,21 +504,25 @@ def main() -> None:
         sync_if_cuda(device)
         step_time = time.perf_counter() - step_start
 
-        mean_loss = reduce_scalar(float(loss.item()), device, op=dist.ReduceOp.SUM)
-        mean_ot = reduce_scalar(ot_time, device, op=dist.ReduceOp.SUM)
+        local_loss = loss_total / float(args.grad_accum_steps)
+        mean_loss = reduce_scalar(local_loss, device, op=dist.ReduceOp.SUM)
+        mean_ot = reduce_scalar(ot_time_total, device, op=dist.ReduceOp.SUM)
+        mean_ot_micro = reduce_scalar(ot_time_total / float(args.grad_accum_steps), device, op=dist.ReduceOp.SUM)
         wall_step = reduce_scalar(step_time, device, op=dist.ReduceOp.MAX)
         if is_rank0 and (step % args.log_step == 0 or step == args.total_steps - 1):
-            images_per_s = args.batch_size / max(wall_step, 1e-12)
+            images_per_s = effective_batch / max(wall_step, 1e-12)
             progress.set_postfix(loss=f"{mean_loss:.4g}", ot_s=f"{mean_ot:.3f}", img_s=f"{images_per_s:.1f}")
             row = {
                 "step": int(step),
                 "loss": mean_loss,
                 "ot_time_s": mean_ot,
+                "ot_time_per_microbatch_s": mean_ot_micro,
                 "step_time_s": wall_step,
                 "images_per_s": images_per_s,
                 "peak_mem_gb": peak_memory_gb(device),
                 "lr": float(sched.get_last_lr()[0]),
-                **coupled.metrics,
+                "effective_batch_size": effective_batch,
+                **summarize_coupling_metrics(coupling_metrics),
             }
             with metrics_path.open("a") as f:
                 f.write(json.dumps(row) + "\n")

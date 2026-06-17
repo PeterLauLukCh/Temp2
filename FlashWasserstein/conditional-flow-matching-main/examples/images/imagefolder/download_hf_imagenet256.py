@@ -39,6 +39,16 @@ def known_split_files(split: str):
             {"path": f"data/train-{idx:05d}-of-00040.parquet", "size": None}
             for idx in range(40)
         ]
+    if split == "validation":
+        return [
+            {"path": f"data/validation-{idx:05d}-of-00002.parquet", "size": None}
+            for idx in range(2)
+        ]
+    if split == "test":
+        return [
+            {"path": f"data/test-{idx:05d}-of-00003.parquet", "size": None}
+            for idx in range(3)
+        ]
     return []
 
 
