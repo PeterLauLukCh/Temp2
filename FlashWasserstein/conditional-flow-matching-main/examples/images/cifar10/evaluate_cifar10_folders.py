@@ -295,22 +295,27 @@ def main() -> None:
             "amp_dtype": args.amp_dtype if args.amp else "",
             "generation_time_s": gen_time,
         }
-        if rank == 0 and not args.only_generate:
-            if image_count(gen_dir) < args.num_gen:
-                raise RuntimeError(f"{gen_dir} has fewer than {args.num_gen} PNGs")
-            print(f"scoring {run_dir.name}", flush=True)
-            row.update(compute_folder_scores(gen_dir, real_dir, args.fid_mode, args.compute_kid))
-            print(json.dumps(row, indent=2), flush=True)
         if rank == 0:
             results.append(row)
         barrier()
 
-    if rank == 0:
-        out_json = out_dir / f"eval_step_{step_tag}_{args.integration_method}{args.integration_steps}_{args.num_gen}.json"
-        out_json.write_text(json.dumps(results, indent=2))
-        print(f"wrote {out_json}", flush=True)
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+    if rank == 0:
+        scored = []
+        for row in results:
+            if not args.only_generate:
+                gen_dir = Path(row["gen_dir"])
+                if image_count(gen_dir) < args.num_gen:
+                    raise RuntimeError(f"{gen_dir} has fewer than {args.num_gen} PNGs")
+                print(f"scoring {row['run']}", flush=True)
+                row.update(compute_folder_scores(gen_dir, real_dir, args.fid_mode, args.compute_kid))
+                print(json.dumps(row, indent=2), flush=True)
+            scored.append(row)
+        out_json = out_dir / f"eval_step_{step_tag}_{args.integration_method}{args.integration_steps}_{args.num_gen}.json"
+        out_json.write_text(json.dumps(scored, indent=2))
+        print(f"wrote {out_json}", flush=True)
 
 
 if __name__ == "__main__":
