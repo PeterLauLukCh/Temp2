@@ -111,6 +111,8 @@ This trains and then evaluates automatically.  The runner defaults to
 context `32768`.  With 8 GPUs, global batch `1024` gives local batch `128`,
 matching the TorchCFM CIFAR-10 recipe while using all GPUs.  Use
 `METHODS="local_exact_pot flash_global_entropic"` for the main comparison only.
+The evaluation sweep uses Euler NFE `10,20,50,100` and 50k generated samples,
+matching the recent expected-batch-OT CIFAR protocol.
 
 For offline evaluation on machines where CleanFID cannot download CIFAR
 statistics, use the folder evaluator.  It writes a local CIFAR-10 reference
