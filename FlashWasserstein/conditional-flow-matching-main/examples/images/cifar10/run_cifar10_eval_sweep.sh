@@ -12,6 +12,11 @@ BATCH_PER_GPU="${BATCH_PER_GPU:-${BATCH:-1024}}"
 INCLUDE="${INCLUDE:-}"
 AMP="${AMP:-1}"
 AMP_DTYPE="${AMP_DTYPE:-fp16}"
+FID_MODE="${FID_MODE:-legacy_tensorflow}"
+SCORE_REFERENCE="${SCORE_REFERENCE:-cleanfid_stats}"
+KID_REFERENCE="${KID_REFERENCE:-folder}"
+DATASET_NAME="${DATASET_NAME:-cifar10}"
+DATASET_RES="${DATASET_RES:-32}"
 
 INCLUDE_FLAG=""
 if [ -n "$INCLUDE" ]; then
@@ -35,6 +40,11 @@ for STEP in $STEPS_LIST; do
       --batch_size "$BATCH_PER_GPU" \
       --integration_method euler \
       --integration_steps "$NFE" \
+      --score_reference "$SCORE_REFERENCE" \
+      --kid_reference "$KID_REFERENCE" \
+      --fid_mode "$FID_MODE" \
+      --dataset_name "$DATASET_NAME" \
+      --dataset_res "$DATASET_RES" \
       --compute_kid \
       $AMP_FLAG \
       $INCLUDE_FLAG

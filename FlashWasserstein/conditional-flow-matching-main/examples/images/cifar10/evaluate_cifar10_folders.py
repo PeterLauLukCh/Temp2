@@ -124,20 +124,41 @@ def image_count(path: Path) -> int:
     return sum(1 for _ in path.glob("*.png")) if path.exists() else 0
 
 
+def expected_cifar_count(split: str) -> int:
+    return 50000 if split == "train" else 10000
+
+
 def write_cifar_reference(data_dir: Path, out_dir: Path, split: str) -> int:
-    expected = 50000 if split == "train" else 10000
+    expected = expected_cifar_count(split)
     if image_count(out_dir) >= expected:
         return expected
     out_dir.mkdir(parents=True, exist_ok=True)
     dataset = datasets.CIFAR10(root=data_dir, train=(split == "train"), download=True)
     for idx, (image, label) in enumerate(dataset):
-        image.save(out_dir / f"{idx:05d}_{int(label):02d}.png")
-    return len(dataset)
+        path = out_dir / f"{idx:05d}_{int(label):02d}.png"
+        if not path.exists():
+            image.save(path)
+        if (idx + 1) % 5000 == 0:
+            print(f"reference images checked={idx + 1} written={image_count(out_dir)}", flush=True)
+    return image_count(out_dir)
+
+
+def wait_for_cifar_reference(out_dir: Path, split: str, timeout_s: int) -> None:
+    expected = expected_cifar_count(split)
+    start = time.perf_counter()
+    while True:
+        count = image_count(out_dir)
+        if count >= expected:
+            return
+        if time.perf_counter() - start > timeout_s:
+            raise TimeoutError(f"timed out waiting for {expected} CIFAR reference PNGs in {out_dir}; found {count}")
+        print(f"waiting for CIFAR reference images: {count}/{expected}", flush=True)
+        time.sleep(30)
 
 
 def save_tensor_images(x: torch.Tensor, out_dir: Path, indices: list[int]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    x = ((x.clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+    x = (x * 127.5 + 128).clamp(0, 255).to(torch.uint8)
     x = x.permute(0, 2, 3, 1).cpu().numpy()
     for arr, idx in zip(x, indices, strict=True):
         Image.fromarray(arr).save(out_dir / f"{idx:08d}.png")
@@ -188,12 +209,50 @@ def generate_folder(
     return time.perf_counter() - start
 
 
-def compute_folder_scores(gen_dir: Path, real_dir: Path, mode: str, compute_kid: bool) -> dict:
+def compute_folder_scores(
+    gen_dir: Path,
+    real_dir: Path,
+    *,
+    mode: str,
+    compute_kid: bool,
+    score_reference: str,
+    kid_reference: str,
+    dataset_name: str,
+    dataset_res: int,
+    dataset_split: str,
+) -> dict:
     from cleanfid import fid
 
-    scores = {
-        "fid": float(fid.compute_fid(fdir1=str(gen_dir), fdir2=str(real_dir), mode=mode)),
-    }
+    if score_reference == "cleanfid_stats":
+        scores = {
+            "fid": float(
+                fid.compute_fid(
+                    fdir1=str(gen_dir),
+                    dataset_name=dataset_name,
+                    dataset_res=dataset_res,
+                    dataset_split=dataset_split,
+                    mode=mode,
+                )
+            ),
+        }
+        if compute_kid:
+            if kid_reference == "cleanfid_stats":
+                scores["kid"] = float(
+                    fid.compute_kid(
+                        fdir1=str(gen_dir),
+                        dataset_name=dataset_name,
+                        dataset_res=dataset_res,
+                        dataset_split=dataset_split,
+                        mode=mode,
+                    )
+                )
+            else:
+                scores["kid"] = float(
+                    fid.compute_kid(fdir1=str(gen_dir), fdir2=str(real_dir), mode=mode)
+                )
+        return scores
+
+    scores = {"fid": float(fid.compute_fid(fdir1=str(gen_dir), fdir2=str(real_dir), mode=mode))}
     if compute_kid:
         scores["kid"] = float(fid.compute_kid(fdir1=str(gen_dir), fdir2=str(real_dir), mode=mode))
     return scores
@@ -220,16 +279,20 @@ def main() -> None:
     parser.add_argument("--integration_method", default="euler", choices=["euler", "heun"])
     parser.add_argument("--state_key", default="ema_model", choices=["ema_model", "net_model"])
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--fid_mode", default="clean")
+    parser.add_argument("--fid_mode", default="legacy_tensorflow")
+    parser.add_argument("--score_reference", default="cleanfid_stats", choices=["cleanfid_stats", "folder"])
+    parser.add_argument("--kid_reference", default="folder", choices=["cleanfid_stats", "folder"])
+    parser.add_argument("--dataset_name", default="cifar10")
+    parser.add_argument("--dataset_res", type=int, default=32)
     parser.add_argument("--compute_kid", action="store_true")
     parser.add_argument("--include", default="", help="Comma-separated run-name substrings to evaluate")
     parser.add_argument("--only_generate", action="store_true")
     parser.add_argument("--only_score", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp_dtype", choices=["fp16", "bf16"], default="fp16")
+    parser.add_argument("--reference_wait_timeout", type=int, default=7200)
     args = parser.parse_args()
 
-    device, rank, world_size = init_distributed()
     run_root = Path(args.run_root).expanduser()
     out_dir = Path(args.out_dir).expanduser()
     data_dir = Path(args.data_dir).expanduser()
@@ -238,12 +301,29 @@ def main() -> None:
     real_dir = out_dir / f"cifar10_{args.split}_real"
     gen_root = out_dir / f"generated_step_{step_tag}_{args.integration_method}{args.integration_steps}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    needs_real_dir = args.score_reference == "folder" or (
+        args.compute_kid and args.kid_reference == "folder"
+    )
+
+    pre_rank = int(os.environ.get("RANK", "0"))
+    if needs_real_dir:
+        if pre_rank == 0:
+            print(f"writing/checking CIFAR-10 {args.split} reference: {real_dir}", flush=True)
+            n_real = write_cifar_reference(data_dir, real_dir, args.split)
+            print(f"reference images={n_real}", flush=True)
+        else:
+            wait_for_cifar_reference(real_dir, args.split, args.reference_wait_timeout)
+
+    device, rank, world_size = init_distributed()
 
     if rank == 0:
         print(f"device={device} world_size={world_size}", flush=True)
-        print(f"writing/checking CIFAR-10 {args.split} reference: {real_dir}", flush=True)
-        n_real = write_cifar_reference(data_dir, real_dir, args.split)
-        print(f"reference images={n_real}", flush=True)
+        if args.score_reference == "cleanfid_stats":
+            print(
+                f"using CleanFID {args.dataset_name}-{args.dataset_res} {args.split} "
+                f"reference stats in {args.fid_mode} mode",
+                flush=True,
+            )
     barrier()
 
     results = []
@@ -288,6 +368,11 @@ def main() -> None:
             "integration_method": args.integration_method,
             "integration_steps": args.integration_steps,
             "state_key": args.state_key,
+            "score_reference": args.score_reference,
+            "kid_reference": args.kid_reference,
+            "fid_mode": args.fid_mode,
+            "dataset_name": args.dataset_name,
+            "dataset_res": args.dataset_res,
             "seed": args.seed,
             "world_size": world_size,
             "batch_size_per_gpu": args.batch_size,
@@ -310,7 +395,19 @@ def main() -> None:
                 if image_count(gen_dir) < args.num_gen:
                     raise RuntimeError(f"{gen_dir} has fewer than {args.num_gen} PNGs")
                 print(f"scoring {row['run']}", flush=True)
-                row.update(compute_folder_scores(gen_dir, real_dir, args.fid_mode, args.compute_kid))
+                row.update(
+                    compute_folder_scores(
+                        gen_dir,
+                        real_dir,
+                        mode=args.fid_mode,
+                        compute_kid=args.compute_kid,
+                        score_reference=args.score_reference,
+                        kid_reference=args.kid_reference,
+                        dataset_name=args.dataset_name,
+                        dataset_res=args.dataset_res,
+                        dataset_split=args.split,
+                    )
+                )
                 print(json.dumps(row, indent=2), flush=True)
             scored.append(row)
         out_json = out_dir / f"eval_step_{step_tag}_{args.integration_method}{args.integration_steps}_{args.num_gen}.json"

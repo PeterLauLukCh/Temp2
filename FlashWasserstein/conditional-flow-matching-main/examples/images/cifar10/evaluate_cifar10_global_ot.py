@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from cleanfid import fid
 from torchvision.utils import save_image
 
@@ -98,21 +99,103 @@ def dopri5_integrate(model, x: torch.Tensor, tol: float) -> torch.Tensor:
     return traj[-1]
 
 
+@torch.no_grad()
+def sample_uint8_batch(
+    model,
+    args,
+    device: torch.device,
+    batch_size: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    x = torch.randn(batch_size, 3, 32, 32, generator=generator, device=device)
+    if args.integration_method == "euler":
+        x = euler_integrate(model, x, args.integration_steps)
+    elif args.integration_method == "heun":
+        x = heun_integrate(model, x, args.integration_steps)
+    elif args.integration_method == "dopri5":
+        x = dopri5_integrate(model, x, args.tol)
+    else:
+        raise ValueError(f"unknown integration method {args.integration_method}")
+    return (x * 127.5 + 128).clip(0, 255).to(torch.uint8)
+
+
 def make_generator(model, args, device: torch.device):
+    generator = None
+    if args.seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed)
+
     def gen(_unused_latent):
-        with torch.no_grad():
-            x = torch.randn(args.batch_size_fid, 3, 32, 32, device=device)
-            if args.integration_method == "euler":
-                x = euler_integrate(model, x, args.integration_steps)
-            elif args.integration_method == "heun":
-                x = heun_integrate(model, x, args.integration_steps)
-            elif args.integration_method == "dopri5":
-                x = dopri5_integrate(model, x, args.tol)
-            else:
-                raise ValueError(f"unknown integration method {args.integration_method}")
-            return (x * 127.5 + 128).clip(0, 255).to(torch.uint8)
+        return sample_uint8_batch(model, args, device, args.batch_size_fid, generator)
 
     return gen
+
+
+@torch.no_grad()
+def compute_inception_score(model, args, device: torch.device) -> dict:
+    try:
+        from torchvision.models import Inception_V3_Weights, inception_v3
+    except Exception as exc:  # pragma: no cover - depends on optional torchvision pieces.
+        raise RuntimeError(
+            "Inception Score needs torchvision InceptionV3 support. "
+            "Install/repair torchvision, or rerun with COMPUTE_IS=0."
+        ) from exc
+
+    try:
+        weights = Inception_V3_Weights.IMAGENET1K_V1
+        inception = inception_v3(weights=weights, transform_input=False).to(device)
+    except Exception as exc:
+        raise RuntimeError(
+            "Inception Score needs pretrained torchvision InceptionV3 weights. "
+            "If the node cannot download them, pre-cache the weights or rerun with COMPUTE_IS=0."
+        ) from exc
+    inception.eval()
+
+    generator = None
+    if args.seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed)
+
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    probs = []
+    start = time.perf_counter()
+    produced = 0
+    while produced < args.num_gen:
+        batch = min(args.is_batch_size, args.num_gen - produced)
+        images = sample_uint8_batch(model, args, device, batch, generator)
+        images = images.float().div(255.0)
+        images = F.interpolate(
+            images,
+            size=(299, 299),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        images = (images - mean) / std
+        logits = inception(images)
+        if hasattr(logits, "logits"):
+            logits = logits.logits
+        probs.append(torch.softmax(logits, dim=1).cpu())
+        produced += batch
+        print(f"IS model: generated {produced}/{args.num_gen}", flush=True)
+
+    probs_t = torch.cat(probs, dim=0)
+    split_count = min(args.is_splits, probs_t.shape[0])
+    scores = []
+    eps = 1e-16
+    for part in torch.chunk(probs_t, split_count):
+        py = part.mean(dim=0, keepdim=True)
+        kl = part * ((part + eps).log() - (py + eps).log())
+        scores.append(torch.exp(kl.sum(dim=1).mean()))
+    scores_t = torch.stack(scores)
+    return {
+        "inception_score_mean": float(scores_t.mean().item()),
+        "inception_score_std": float(scores_t.std(unbiased=False).item()),
+        "inception_score_splits": int(split_count),
+        "inception_score_backend": "torchvision_inception_v3_imagenet1k",
+        "inception_score_elapsed_s": time.perf_counter() - start,
+    }
 
 
 def save_preview(model, path: Path, args, device: torch.device) -> None:
@@ -161,7 +244,10 @@ def evaluate_checkpoint(path: Path, args, device: torch.device) -> dict:
         "integration_method": args.integration_method,
         "integration_steps": int(args.integration_steps),
         "elapsed_s": elapsed,
+        "seed": args.seed,
     }
+    if args.compute_is:
+        result.update(compute_inception_score(model, args, device))
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -179,12 +265,16 @@ def main() -> None:
     parser.add_argument("--preview_batch", type=int, default=64)
     parser.add_argument("--num_gen", type=int, default=50000)
     parser.add_argument("--batch_size_fid", type=int, default=1024)
+    parser.add_argument("--compute_is", action="store_true")
+    parser.add_argument("--is_batch_size", type=int, default=512)
+    parser.add_argument("--is_splits", type=int, default=10)
     parser.add_argument("--integration_method", choices=["euler", "heun", "dopri5"], default="euler")
     parser.add_argument("--integration_steps", type=int, default=100)
     parser.add_argument("--tol", type=float, default=1e-5)
     parser.add_argument("--dataset_split", default="train")
     parser.add_argument("--fid_mode", default="legacy_tensorflow")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
