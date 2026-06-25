@@ -1,4 +1,4 @@
-"""Evaluate CIFAR-10 global OT-CFM checkpoints with clean-FID.
+"""Evaluate CIFAR global OT-CFM checkpoints with clean-FID.
 
 The original CIFAR evaluator in this repo assumes the historical checkpoint
 layout.  This script accepts either one direct checkpoint or a run root
@@ -280,9 +280,9 @@ def evaluate_checkpoint(path: Path, args, device: torch.device) -> dict:
     start = time.perf_counter()
     fid_kwargs = {
         "gen": make_generator(model, args, device),
-        "dataset_name": "cifar10",
+        "dataset_name": args.dataset_name,
         "batch_size": args.batch_size_fid,
-        "dataset_res": 32,
+        "dataset_res": args.dataset_res,
         "num_gen": args.num_gen,
         "dataset_split": args.dataset_split,
         "mode": args.fid_mode,
@@ -303,6 +303,10 @@ def evaluate_checkpoint(path: Path, args, device: torch.device) -> dict:
         "num_gen": int(args.num_gen),
         "integration_method": args.integration_method,
         "integration_steps": int(args.integration_steps),
+        "dataset_name": args.dataset_name,
+        "dataset_res": args.dataset_res,
+        "dataset_split": args.dataset_split,
+        "fid_mode": args.fid_mode,
         "elapsed_s": elapsed,
         "seed": args.seed,
     }
@@ -331,6 +335,8 @@ def main() -> None:
     parser.add_argument("--integration_method", choices=["euler", "heun", "dopri5"], default="euler")
     parser.add_argument("--integration_steps", type=int, default=100)
     parser.add_argument("--tol", type=float, default=1e-5)
+    parser.add_argument("--dataset_name", default="cifar10")
+    parser.add_argument("--dataset_res", type=int, default=32)
     parser.add_argument("--dataset_split", default="train")
     parser.add_argument("--fid_mode", default="legacy_tensorflow")
     parser.add_argument("--device", default="cuda")

@@ -1,4 +1,4 @@
-"""Standard CIFAR-10 pixel-space FM/OT-CFM with local or global couplings.
+"""Standard CIFAR pixel-space FM/OT-CFM with local or global couplings.
 
 This is the first benchmark in the Flash global OT-CFM protocol.  It keeps the
 standard CIFAR UNet recipe but replaces the pairing stage with the shared
@@ -44,6 +44,10 @@ from torchcfm.ot_coupling import (  # noqa: E402
 
 OFFICIAL_OTCFM_MODE = "official_otcfm_exact"
 TRAINING_MODES = sorted(set(COUPLING_MODES) | {OFFICIAL_OTCFM_MODE})
+DATASETS = {
+    "cifar10": datasets.CIFAR10,
+    "cifar100": datasets.CIFAR100,
+}
 
 
 def is_distributed() -> bool:
@@ -124,6 +128,13 @@ def build_official_otcfm(args) -> ExactOptimalTransportConditionalFlowMatcher:
         ot_method="exact",
         num_threads=args.pot_num_threads,
     )
+
+
+def dataset_cls(name: str):
+    try:
+        return DATASETS[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown dataset {name!r}; expected one of {sorted(DATASETS)}") from exc
 
 
 @torch.no_grad()
@@ -223,6 +234,7 @@ def evaluate_validation_loss(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=sorted(DATASETS), default="cifar10")
     parser.add_argument("--data_dir", default="./data")
     parser.add_argument("--output_dir", default="./results_cifar10_global_ot")
     parser.add_argument("--coupling_mode", default="independent", choices=TRAINING_MODES)
@@ -237,6 +249,8 @@ def main() -> None:
     parser.add_argument("--total_steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup", type=int, default=5000)
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"], default="constant")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--save_step", type=int, default=10000)
@@ -276,13 +290,14 @@ def main() -> None:
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
+    cifar_dataset = dataset_cls(args.dataset)
     if is_rank0:
-        datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=transform)
+        cifar_dataset(root=args.data_dir, train=True, download=True, transform=transform)
         if args.val_every > 0:
-            datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=transform)
+            cifar_dataset(root=args.data_dir, train=False, download=True, transform=transform)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
-    dataset = datasets.CIFAR10(
+    dataset = cifar_dataset(
         root=args.data_dir,
         train=True,
         download=False,
@@ -310,7 +325,7 @@ def main() -> None:
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ]
         )
-        val_dataset = datasets.CIFAR10(
+        val_dataset = cifar_dataset(
             root=args.data_dir,
             train=False,
             download=False,
@@ -364,10 +379,18 @@ def main() -> None:
         net_model = DistributedDataParallel(net_model, device_ids=[device.index])
     optim = torch.optim.Adam(unwrap(net_model).parameters(), lr=args.lr)
 
-    def warmup_lr(step):
-        return min(step + 1, args.warmup) / float(max(args.warmup, 1))
+    def lr_multiplier(step):
+        warmup = max(args.warmup, 1)
+        if step < warmup:
+            return min(step + 1, warmup) / float(warmup)
+        if args.lr_schedule == "constant":
+            return 1.0
+        progress = (step - warmup) / float(max(args.total_steps - warmup, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return float(args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine)
 
-    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_multiplier)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
     run_name = (
         f"{args.coupling_mode}_ctx{args.context_size}_eps{args.eps:g}_"
@@ -377,7 +400,7 @@ def main() -> None:
     if is_rank0:
         out_dir.mkdir(parents=True, exist_ok=True)
         params = sum(p.numel() for p in unwrap(net_model).parameters())
-        print(f"dataset=CIFAR10 train images={len(dataset)}")
+        print(f"dataset={args.dataset} train images={len(dataset)}")
         print(f"world_size={world_size} global_batch={args.batch_size} local_batch={local_batch}")
         print(f"coupling={args.coupling_mode} context={args.context_size} eps={args.eps}")
         if official_fm is not None:
