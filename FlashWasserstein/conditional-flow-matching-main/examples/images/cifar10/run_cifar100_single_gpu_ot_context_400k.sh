@@ -121,6 +121,7 @@ import cleanfid
 import numpy as np
 import torch
 from cleanfid import fid
+from PIL import Image
 from torchvision.datasets import CIFAR100
 
 data_dir = Path("$DATA_DIR")
@@ -142,13 +143,22 @@ if stat_path.exists():
 if not stat_path.exists():
     ds = CIFAR100(root=str(data_dir), train=True, download=False)
     png_dir.mkdir(parents=True, exist_ok=True)
-    existing = sum(1 for _ in png_dir.glob("*.png"))
-    if existing != len(ds):
-        print(f"writing CIFAR-100 train PNG reference: {png_dir}")
-        for idx, (img, _label) in enumerate(ds):
-            path = png_dir / f"{idx:05d}.png"
-            if not path.exists():
-                img.save(path)
+    bad = []
+    for path in png_dir.glob("*.png"):
+        try:
+            with Image.open(path) as img:
+                img.verify()
+        except Exception:
+            bad.append(path)
+    if bad:
+        print(f"removing {len(bad)} corrupt CIFAR-100 train PNGs")
+        for path in bad:
+            path.unlink(missing_ok=True)
+    print(f"writing/verifying CIFAR-100 train PNG reference: {png_dir}")
+    for idx, (img, _label) in enumerate(ds):
+        path = png_dir / f"{idx:05d}.png"
+        if not path.exists():
+            img.save(path)
     print("making CleanFID custom stats: cifar100_train")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     fid.make_custom_stats(
