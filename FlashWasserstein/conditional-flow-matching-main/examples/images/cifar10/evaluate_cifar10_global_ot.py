@@ -8,6 +8,7 @@ containing the standardized global-OT experiment directories.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import sys
@@ -124,9 +125,32 @@ def make_generator(model, args, device: torch.device):
     if args.seed is not None:
         generator = torch.Generator(device=device)
         generator.manual_seed(args.seed)
+    state = {"calls": 0}
 
     def gen(_unused_latent):
-        return sample_uint8_batch(model, args, device, args.batch_size_fid, generator)
+        state["calls"] += 1
+        if args.debug_cuda:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            mem = torch.cuda.memory_allocated(device) / 1e9 if device.type == "cuda" else 0.0
+            print(
+                f"FID generator call {state['calls']}: start device={device} "
+                f"memGB={mem:.3f}",
+                flush=True,
+            )
+            start = time.perf_counter()
+        images = sample_uint8_batch(model, args, device, args.batch_size_fid, generator)
+        if args.debug_cuda:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            mem = torch.cuda.memory_allocated(device) / 1e9 if device.type == "cuda" else 0.0
+            print(
+                f"FID generator call {state['calls']}: done "
+                f"elapsed_s={time.perf_counter() - start:.3f} "
+                f"out_device={images.device} out_dtype={images.dtype} memGB={mem:.3f}",
+                flush=True,
+            )
+        return images
 
     return gen
 
@@ -212,12 +236,41 @@ def save_preview(model, path: Path, args, device: torch.device) -> None:
 
 
 def evaluate_checkpoint(path: Path, args, device: torch.device) -> dict:
+    if args.debug_cuda:
+        print(f"eval device={device} cuda_available={torch.cuda.is_available()}", flush=True)
+        if device.type == "cuda":
+            print(f"cuda name={torch.cuda.get_device_name(device)}", flush=True)
+    if args.debug_cuda:
+        print(f"torch.load start {path}", flush=True)
+        load_start = time.perf_counter()
     checkpoint = torch.load(path, map_location="cpu")
+    if args.debug_cuda:
+        print(f"torch.load done elapsed_s={time.perf_counter() - load_start:.3f}", flush=True)
     train_args = argparse.Namespace(**checkpoint.get("args", {}))
+    if args.debug_cuda:
+        print("build/model.to start", flush=True)
+        model_start = time.perf_counter()
     model = build_model(train_args).to(device)
+    if args.debug_cuda and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        print(
+            f"build/model.to done elapsed_s={time.perf_counter() - model_start:.3f} "
+            f"memGB={torch.cuda.memory_allocated(device) / 1e9:.3f}",
+            flush=True,
+        )
     state = checkpoint.get("ema_model", checkpoint.get("net_model"))
+    if args.debug_cuda:
+        print("load_state_dict start", flush=True)
+        state_start = time.perf_counter()
     model.load_state_dict(strip_module_prefix(state))
     model.eval()
+    if args.debug_cuda and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        print(
+            f"load_state_dict done elapsed_s={time.perf_counter() - state_start:.3f} "
+            f"memGB={torch.cuda.memory_allocated(device) / 1e9:.3f}",
+            flush=True,
+        )
 
     if args.preview_dir:
         preview_dir = Path(args.preview_dir).expanduser()
@@ -225,15 +278,22 @@ def evaluate_checkpoint(path: Path, args, device: torch.device) -> dict:
         save_preview(model, preview_dir / f"{path.parent.name}.png", args, device)
 
     start = time.perf_counter()
-    score = fid.compute_fid(
-        gen=make_generator(model, args, device),
-        dataset_name="cifar10",
-        batch_size=args.batch_size_fid,
-        dataset_res=32,
-        num_gen=args.num_gen,
-        dataset_split=args.dataset_split,
-        mode=args.fid_mode,
-    )
+    fid_kwargs = {
+        "gen": make_generator(model, args, device),
+        "dataset_name": "cifar10",
+        "batch_size": args.batch_size_fid,
+        "dataset_res": 32,
+        "num_gen": args.num_gen,
+        "dataset_split": args.dataset_split,
+        "mode": args.fid_mode,
+    }
+    if "device" in inspect.signature(fid.compute_fid).parameters:
+        fid_kwargs["device"] = device
+    if "verbose" in inspect.signature(fid.compute_fid).parameters:
+        fid_kwargs["verbose"] = True
+    if args.debug_cuda:
+        print(f"compute_fid start kwargs_device={fid_kwargs.get('device', '<default>')}", flush=True)
+    score = fid.compute_fid(**fid_kwargs)
     elapsed = time.perf_counter() - start
     result = {
         "run": path.parent.name,
@@ -275,6 +335,7 @@ def main() -> None:
     parser.add_argument("--fid_mode", default="legacy_tensorflow")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--debug_cuda", action="store_true")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
