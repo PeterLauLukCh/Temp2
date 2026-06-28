@@ -232,6 +232,138 @@ def evaluate_validation_loss(
     return total_loss_sum, total_ot_time, total_samples, total_batches
 
 
+def snapshot_ot_sampler_queue(ot_sampler: OTCouplingSampler | None):
+    if ot_sampler is None:
+        return None
+    queue = ot_sampler.target_queue
+    return queue.x, queue.h, queue.y
+
+
+def restore_ot_sampler_queue(ot_sampler: OTCouplingSampler | None, snapshot) -> None:
+    if ot_sampler is None or snapshot is None:
+        return
+    queue = ot_sampler.target_queue
+    queue.x, queue.h, queue.y = snapshot
+
+
+def gradient_trace_variance_probe(
+    model,
+    data_iter,
+    ot_sampler: OTCouplingSampler | None,
+    device: torch.device,
+    *,
+    probe_batches: int,
+    step: int,
+    seed: int,
+    amp: bool,
+    official_fm: ExactOptimalTransportConditionalFlowMatcher | None = None,
+) -> dict[str, float | int | str]:
+    """Estimate Tr Cov of the actual minibatch-gradient estimator.
+
+    The probe computes K independent ghost-batch gradients at fixed parameters.
+    With DDP, each backward performs the normal gradient all-reduce, so the
+    samples are global-batch gradients rather than local-rank gradients.
+    """
+
+    batches = max(int(probe_batches), 1)
+    params = [p for p in unwrap(model).parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("gradient variance probe found no trainable parameters.")
+
+    was_training = model.training
+    model.train()
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed) + 1_000_003 * int(step) + 9_176 * int(rank))
+
+    queue_snapshot = snapshot_ot_sampler_queue(ot_sampler)
+    grad_sums = [torch.zeros_like(p.detach(), dtype=torch.float32, device=p.device) for p in params]
+    sum_grad_norm_sq = torch.zeros((), device=device, dtype=torch.float64)
+    sum_loss = 0.0
+    sum_ot_time = 0.0
+    local_batch = 0
+    sync_if_cuda(device)
+    start = time.perf_counter()
+
+    for probe_idx in range(batches):
+        restore_ot_sampler_queue(ot_sampler, queue_snapshot)
+        model.zero_grad(set_to_none=True)
+
+        x1, _labels = next(data_iter)
+        x1 = x1.to(device, non_blocking=True)
+        local_batch = int(x1.shape[0])
+        x0 = torch.randn(x1.shape, device=device, dtype=x1.dtype, generator=generator)
+
+        sync_if_cuda(device)
+        ot_start = time.perf_counter()
+        if official_fm is not None:
+            t, xt, ut = official_fm.sample_location_and_conditional_flow(x0, x1)
+        else:
+            if ot_sampler is None:
+                raise RuntimeError("ot_sampler is required unless official_fm is provided.")
+            coupled = ot_sampler.sample_pairs(x0, x1, step=step * batches + probe_idx)
+            t = torch.rand(coupled.x0.shape[0], device=device, generator=generator)
+            t_view = t.view(-1, 1, 1, 1)
+            xt = (1.0 - t_view) * coupled.x0 + t_view * coupled.x1
+            ut = coupled.x1 - coupled.x0
+        sync_if_cuda(device)
+        sum_ot_time += time.perf_counter() - ot_start
+
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp and device.type == "cuda"):
+            vt = model(t, xt)
+            loss = torch.mean((vt - ut) ** 2)
+        loss.backward()
+        sum_loss += float(loss.item())
+
+        grad_norm_sq = torch.zeros((), device=device, dtype=torch.float64)
+        for grad_sum, param in zip(grad_sums, params):
+            if param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            grad_norm_sq += grad.pow(2).sum(dtype=torch.float64)
+            grad_sum.add_(grad)
+        sum_grad_norm_sq += grad_norm_sq
+
+    restore_ot_sampler_queue(ot_sampler, queue_snapshot)
+    model.zero_grad(set_to_none=True)
+    sync_if_cuda(device)
+    elapsed = time.perf_counter() - start
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+
+    mean_grad_norm_sq = torch.zeros((), device=device, dtype=torch.float64)
+    for grad_sum in grad_sums:
+        mean_grad_norm_sq += grad_sum.pow(2).sum(dtype=torch.float64)
+    mean_grad_norm_sq = mean_grad_norm_sq / float(batches * batches)
+    centered_sum_sq = sum_grad_norm_sq - float(batches) * mean_grad_norm_sq
+    centered_sum_sq = torch.clamp(centered_sum_sq, min=0.0)
+    trace_cov = centered_sum_sq / float(max(batches - 1, 1))
+    trace_cov_biased = centered_sum_sq / float(batches)
+
+    global_batch = local_batch * int(world_size)
+    noise_scale = trace_cov / torch.clamp(mean_grad_norm_sq, min=1e-30)
+    loss_mean = reduce_scalar(sum_loss / float(batches), device, op=dist.ReduceOp.SUM)
+    ot_time_mean = reduce_scalar(sum_ot_time / float(batches), device, op=dist.ReduceOp.SUM)
+    elapsed = reduce_scalar(elapsed, device, op=dist.ReduceOp.MAX)
+    return {
+        "grad_var_estimator": "ghost_batch_global_ddp",
+        "grad_var_batches": int(batches),
+        "grad_var_local_batch": int(local_batch),
+        "grad_var_global_batch": int(global_batch),
+        "grad_var_trace": float(trace_cov.item()),
+        "grad_var_trace_biased": float(trace_cov_biased.item()),
+        "grad_var_grad_norm_sq_mean": float((sum_grad_norm_sq / float(batches)).item()),
+        "grad_var_mean_grad_norm_sq": float(mean_grad_norm_sq.item()),
+        "grad_var_noise_scale": float(noise_scale.item()),
+        "grad_var_loss_mean": float(loss_mean),
+        "grad_var_ot_time_s_mean": float(ot_time_mean),
+        "grad_var_time_s": float(elapsed),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=sorted(DATASETS), default="cifar10")
@@ -260,6 +392,8 @@ def main() -> None:
     parser.add_argument("--log_step", type=int, default=20)
     parser.add_argument("--val_every", type=int, default=0, help="0 disables held-out CIFAR-10 loss")
     parser.add_argument("--val_batches", type=int, default=8, help="0 uses the full validation loader")
+    parser.add_argument("--grad_var_every", type=int, default=0, help="0 disables ghost-batch gradient variance tracing")
+    parser.add_argument("--grad_var_batches", type=int, default=16, help="number of ghost gradients per variance probe")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_channel", type=int, default=128)
     parser.add_argument("--num_res_blocks", type=int, default=2)
@@ -314,6 +448,23 @@ def main() -> None:
         drop_last=True,
     )
     data_iter = infinite_loader(loader, sampler_ddp)
+
+    grad_var_iter = None
+    grad_var_sampler_ddp = None
+    if args.grad_var_every > 0:
+        grad_var_sampler_ddp = (
+            DistributedSampler(dataset, shuffle=True, seed=args.seed + 70717) if world_size > 1 else None
+        )
+        grad_var_loader = DataLoader(
+            dataset,
+            batch_size=local_batch,
+            shuffle=grad_var_sampler_ddp is None,
+            sampler=grad_var_sampler_ddp,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=True,
+        )
+        grad_var_iter = infinite_loader(grad_var_loader, grad_var_sampler_ddp)
 
     val_iter = None
     val_ot_sampler = None
@@ -405,10 +556,16 @@ def main() -> None:
         print(f"coupling={args.coupling_mode} context={args.context_size} eps={args.eps}")
         if official_fm is not None:
             print("official_otcfm=ExactOptimalTransportConditionalFlowMatcher(ot_method='exact')")
+        if args.grad_var_every > 0:
+            print(
+                f"gradient_variance_probe every={args.grad_var_every} "
+                f"ghost_batches={args.grad_var_batches}"
+            )
         print(f"model_params={params / 1024 / 1024:.2f}M output={out_dir}")
         (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
 
     metrics_path = out_dir / "metrics.jsonl"
+    grad_var_path = out_dir / "grad_variance.jsonl"
     progress = trange(args.total_steps, dynamic_ncols=True, disable=not is_rank0)
     for step in progress:
         sync_if_cuda(device)
@@ -496,15 +653,48 @@ def main() -> None:
                 "val_images": int(global_val_samples),
             }
 
-        should_log = step % args.log_step == 0 or step == args.total_steps - 1 or should_validate
+        grad_var_metrics = {}
+        global_step = step + 1
+        should_probe_grad_var = (
+            args.grad_var_every > 0
+            and grad_var_iter is not None
+            and (official_fm is not None or ot_sampler is not None)
+            and global_step % args.grad_var_every == 0
+        )
+        if should_probe_grad_var:
+            sync_if_cuda(device)
+            grad_var_metrics = gradient_trace_variance_probe(
+                net_model,
+                grad_var_iter,
+                ot_sampler,
+                device,
+                probe_batches=args.grad_var_batches,
+                step=global_step,
+                seed=args.seed,
+                amp=args.amp,
+                official_fm=official_fm,
+            )
+            if is_rank0:
+                with grad_var_path.open("a") as f:
+                    f.write(json.dumps({"step": int(global_step), **grad_var_metrics}) + "\n")
+
+        should_log = (
+            step % args.log_step == 0
+            or step == args.total_steps - 1
+            or should_validate
+            or bool(grad_var_metrics)
+        )
         if is_rank0 and should_log:
             images_per_s = args.batch_size / max(wall_step, 1e-12)
             postfix = {"loss": f"{mean_loss:.4g}", "ot_s": f"{mean_ot:.3f}", "img_s": f"{images_per_s:.1f}"}
             if val_metrics:
                 postfix["val"] = f"{val_metrics['val_loss']:.4g}"
+            if grad_var_metrics:
+                postfix["gvar"] = f"{grad_var_metrics['grad_var_trace']:.3g}"
             progress.set_postfix(**postfix)
             row = {
                 "step": int(step),
+                "updates": int(global_step),
                 "loss": mean_loss,
                 "ot_time_s": mean_ot,
                 "ot_s": mean_ot,
@@ -517,6 +707,7 @@ def main() -> None:
                 "lr": float(sched.get_last_lr()[0]),
                 **coupled_metrics,
                 **val_metrics,
+                **grad_var_metrics,
             }
             with metrics_path.open("a") as f:
                 f.write(json.dumps(row) + "\n")
